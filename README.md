@@ -64,6 +64,10 @@ BANK_GROUP_ID = -1000000000000  # Your payment group ID
 
 4. **Run the bot:**
 ```bash
+# Simple startup with automatic dependency checking
+python start_bot.py
+
+# Or run directly
 python main.py
 ```
 
@@ -220,20 +224,36 @@ python main.py
 
 ### Common Issues
 
-1. **Session Authentication Failed**
+1. **Network Errors / Connection Issues**
+   - Bot automatically retries network requests
+   - Check your internet connection
+   - Verify bot token is correct
+   - Ensure Telegram servers are accessible
+
+2. **"Updater is still running" Error**
+   - Stop any existing bot processes: `pkill -f python`
+   - Wait 30 seconds before restarting
+   - Use `python start_bot.py` for better error handling
+
+3. **Session Authentication Failed**
    - Verify 2FA is enabled on the account
    - Check API credentials are correct
    - Ensure phone number format is valid
 
-2. **Group Transfer Failed**
+4. **Group Transfer Failed**
    - Verify user has joined the group
    - Check userbot has admin rights
    - Confirm 2FA password is correct
 
-3. **Payment Not Detected**
+5. **Payment Not Detected**
    - Ensure payment sent via @cctip_bot
    - Check payment was sent in correct group
    - Verify USDT currency was used
+
+6. **Import/Installation Issues**
+   - Use `python start_bot.py` for automatic dependency installation
+   - Create virtual environment: `python -m venv venv && source venv/bin/activate`
+   - Install manually: `pip install -r requirements.txt`
 
 ### Logs and Debugging
 - Bot logs stored in `bot.log`

@@ -7,6 +7,7 @@ A bot for buying and selling Telegram groups with secure ownership transfer.
 import asyncio
 import logging
 import sys
+import signal
 from datetime import datetime
 
 from telegram import Update
@@ -14,6 +15,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters, ContextTypes
 )
+from telegram.error import NetworkError, TimedOut, BadRequest
 
 # Import our modules
 from config import BOT_TOKEN, BOT_OWNERS, BANK_GROUP_ID, CCTIP_BOT_ID
@@ -36,6 +38,7 @@ logger = logging.getLogger(__name__)
 class TelegramMarketBot:
     def __init__(self):
         self.application = None
+        self.is_running = False
         
     def setup_handlers(self):
         """Setup all command and message handlers"""
@@ -87,8 +90,23 @@ class TelegramMarketBot:
         logger.info("All handlers setup complete")
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle errors"""
-        logger.error(f"Exception while handling an update: {context.error}")
+        """Handle errors with improved error categorization"""
+        error = context.error
+        
+        # Log the error
+        logger.error(f"Exception while handling an update: {error}")
+        
+        # Handle different types of errors
+        if isinstance(error, NetworkError):
+            logger.error("Network error occurred. Bot will retry automatically.")
+            return
+        elif isinstance(error, TimedOut):
+            logger.error("Request timed out. Bot will retry automatically.")
+            return
+        elif isinstance(error, BadRequest):
+            logger.error(f"Bad request error: {error}")
+        else:
+            logger.error(f"Unexpected error: {error}")
         
         # Try to send error message to user if possible
         if update and update.effective_message:
@@ -101,26 +119,34 @@ class TelegramMarketBot:
                 logger.error(f"Failed to send error message to user: {e}")
     
     async def startup_message(self):
-        """Send startup message to bot owners"""
-        try:
-            for owner_id in BOT_OWNERS:
-                await self.application.bot.send_message(
-                    chat_id=owner_id,
-                    text="🤖 **Bot Started Successfully!**\n\n"
-                         f"**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                         f"**Status:** ✅ Online\n"
-                         f"**Database:** ✅ Connected\n"
-                         f"**Sessions:** ✅ Ready",
-                    parse_mode='Markdown'
-                )
-                logger.info(f"Startup message sent to owner {owner_id}")
-        except Exception as e:
-            logger.error(f"Failed to send startup message: {e}")
+        """Send startup message to bot owners with retry logic"""
+        for owner_id in BOT_OWNERS:
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    await self.application.bot.send_message(
+                        chat_id=owner_id,
+                        text="🤖 **Bot Started Successfully!**\n\n"
+                             f"**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                             f"**Status:** ✅ Online\n"
+                             f"**Database:** ✅ Connected\n"
+                             f"**Sessions:** ✅ Ready",
+                        parse_mode='Markdown'
+                    )
+                    logger.info(f"Startup message sent to owner {owner_id}")
+                    break
+                except (NetworkError, TimedOut) as e:
+                    logger.warning(f"Failed to send startup message to {owner_id} (attempt {attempt + 1}): {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                except Exception as e:
+                    logger.error(f"Unexpected error sending startup message: {e}")
+                    break
     
     async def shutdown_message(self):
         """Send shutdown message to bot owners"""
-        try:
-            for owner_id in BOT_OWNERS:
+        for owner_id in BOT_OWNERS:
+            try:
                 await self.application.bot.send_message(
                     chat_id=owner_id,
                     text="🤖 **Bot Shutting Down**\n\n"
@@ -129,14 +155,31 @@ class TelegramMarketBot:
                     parse_mode='Markdown'
                 )
                 logger.info(f"Shutdown message sent to owner {owner_id}")
-        except Exception as e:
-            logger.error(f"Failed to send shutdown message: {e}")
+            except Exception as e:
+                logger.error(f"Failed to send shutdown message: {e}")
+    
+    def signal_handler(self, signum, frame):
+        """Handle system signals for graceful shutdown"""
+        logger.info(f"Received signal {signum}. Shutting down gracefully...")
+        self.is_running = False
     
     async def run(self):
-        """Run the bot"""
+        """Run the bot with improved error handling and recovery"""
         try:
-            # Create application
-            self.application = Application.builder().token(BOT_TOKEN).build()
+            # Set up signal handlers
+            signal.signal(signal.SIGINT, self.signal_handler)
+            signal.signal(signal.SIGTERM, self.signal_handler)
+            
+            # Create application with improved settings
+            self.application = (
+                Application.builder()
+                .token(BOT_TOKEN)
+                .read_timeout(30)
+                .write_timeout(30)
+                .connect_timeout(30)
+                .pool_timeout(30)
+                .build()
+            )
             
             # Setup handlers
             self.setup_handlers()
@@ -146,21 +189,35 @@ class TelegramMarketBot:
             
             # Start the bot
             await self.application.start()
+            self.is_running = True
             
             # Send startup message
             await self.startup_message()
             
             logger.info("🤖 Telegram Group Market Bot started successfully!")
-            logger.info(f"Bot username: @{self.application.bot.username}")
             
-            # Start polling
+            try:
+                bot_info = await self.application.bot.get_me()
+                logger.info(f"Bot username: @{bot_info.username}")
+            except Exception as e:
+                logger.warning(f"Could not get bot info: {e}")
+            
+            # Start polling with improved settings
             await self.application.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True
+                drop_pending_updates=True,
+                read_timeout=30,
+                write_timeout=30,
+                connect_timeout=30,
+                pool_timeout=30
             )
             
             # Keep the bot running
-            await self.application.updater.idle()
+            while self.is_running:
+                try:
+                    await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    break
             
         except Exception as e:
             logger.error(f"Critical error in bot execution: {e}")
@@ -168,16 +225,26 @@ class TelegramMarketBot:
         finally:
             # Cleanup
             logger.info("Bot shutting down...")
-            await self.shutdown_message()
+            self.is_running = False
+            
+            try:
+                await self.shutdown_message()
+            except Exception as e:
+                logger.error(f"Error sending shutdown message: {e}")
             
             if self.application:
-                await self.application.stop()
-                await self.application.shutdown()
+                try:
+                    if self.application.updater.running:
+                        await self.application.updater.stop()
+                    await self.application.stop()
+                    await self.application.shutdown()
+                except Exception as e:
+                    logger.error(f"Error during cleanup: {e}")
             
             logger.info("Bot shutdown complete")
 
 def main():
-    """Main function"""
+    """Main function with improved error handling"""
     try:
         # Check if database is accessible
         logger.info("Checking database connection...")
@@ -189,6 +256,11 @@ def main():
         if not os.path.exists('sessions'):
             os.makedirs('sessions')
             logger.info("Created sessions directory")
+        
+        # Validate bot token
+        if not BOT_TOKEN or BOT_TOKEN == "your_bot_token_here":
+            logger.error("Invalid bot token. Please configure BOT_TOKEN in config.py")
+            sys.exit(1)
         
         # Initialize and run bot
         bot = TelegramMarketBot()
