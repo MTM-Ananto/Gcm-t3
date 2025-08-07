@@ -1056,6 +1056,124 @@ class BotCommands:
     def __init__(self):
         self.user_contexts = {}
         self.pending_purchases = {}
+    
+    def get_purchased_group_by_id(self, group_id: int, user_id: int) -> Optional[Dict]:
+        """Check if group was purchased by user"""
+        with db.lock:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT g.*, t.user_id as buyer_id
+                FROM groups g
+                JOIN transactions t ON JSON_EXTRACT(t.group_ids, '$') LIKE '%' || g.group_id || '%'
+                WHERE g.group_id = ? AND t.user_id = ? AND t.transaction_type = 'purchase'
+                AND t.status = 'completed' AND g.is_listed = FALSE
+            ''', (group_id, user_id))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                return {
+                    'id': result[0],
+                    'group_id': result[1],
+                    'buying_id': result[2],
+                    'session_id': result[7],
+                    'price': result[8]
+                }
+            return None
+    
+    def get_session_by_id(self, session_id: int) -> Optional[Dict]:
+        """Get session data by ID"""
+        with db.lock:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT api_id, api_hash, session_string, password_hash, has_2fa
+                FROM sessions WHERE id = ? AND is_active = TRUE
+            ''', (session_id,))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                return {
+                    'api_id': result[0],
+                    'api_hash': result[1],
+                    'session_string': result[2],
+                    'password_hash': result[3],
+                    'has_2fa': result[4]
+                }
+            return None
+    
+    def mark_group_as_transferred(self, group_id: int, new_owner_id: int):
+        """Mark group as transferred"""
+        with db.lock:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE groups SET owner_user_id = ?, is_listed = FALSE
+                WHERE id = ?
+            ''', (new_owner_id, group_id))
+            conn.commit()
+            conn.close()
+    
+    def get_pending_listing(self, user_id: int, group_id: int) -> Optional[Dict]:
+        """Get pending listing for user and group"""
+        with db.lock:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM pending_listings 
+                WHERE user_id = ? AND group_id = ? 
+                AND expires_at > datetime('now')
+            ''', (user_id, group_id))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                return {
+                    'id': result[0],
+                    'user_id': result[1],
+                    'group_id': result[2],
+                    'price': result[3],
+                    'userbot_username': result[4],
+                    'expires_at': result[5],
+                    'created_at': result[6]
+                }
+            return None
+    
+    def remove_pending_listing(self, user_id: int, group_id: int):
+        """Remove pending listing"""
+        with db.lock:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                DELETE FROM pending_listings 
+                WHERE user_id = ? AND group_id = ?
+            ''', (user_id, group_id))
+            conn.commit()
+            conn.close()
+    
+    def add_pending_listing(self, user_id: int, group_id: int, price: float):
+        """Add pending listing"""
+        from datetime import datetime, timedelta
+        
+        with db.lock:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            
+            expires_at = datetime.now() + timedelta(seconds=LISTING_TIMEOUT)
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO pending_listings 
+                (user_id, group_id, price, userbot_username, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, group_id, price, "userbot", expires_at))
+            
+            conn.commit()
+            conn.close()
         
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -1213,7 +1331,7 @@ Select a year to browse groups by creation date:
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
     
     async def claim_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /claim command"""
+        """Handle /claim command with real ownership transfer"""
         user = update.effective_user
         chat = update.effective_chat
         
@@ -1224,11 +1342,80 @@ Select a year to browse groups by creation date:
             )
             return
         
+        # Check if group exists in database and was purchased by user
+        group_info = self.get_purchased_group_by_id(chat.id, user.id)
+        if not group_info:
+            await update.message.reply_text(
+                "❌ This group was not purchased by you or is not available for claiming.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
         await update.message.reply_text(
             "🔄 Processing ownership transfer...\n\n"
-            "Please wait while we verify your purchase and transfer ownership.",
+            "Verifying your membership and transferring ownership...",
             parse_mode=ParseMode.MARKDOWN
         )
+        
+        try:
+            # Get session for this group
+            session_data = self.get_session_by_id(group_info['session_id'])
+            if not session_data:
+                await update.message.reply_text(
+                    "❌ Unable to access userbot session for this group.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Create Telethon client
+            client = TelegramClient(
+                session=session_data['session_string'],
+                api_id=session_data['api_id'],
+                api_hash=session_data['api_hash']
+            )
+            
+            await client.connect()
+            
+            # Check if user is in the group
+            is_member = await session_manager.check_user_in_group(client, chat.id, user.id)
+            if not is_member:
+                await update.message.reply_text(
+                    "❌ You must join the group first before claiming ownership.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                await client.disconnect()
+                return
+            
+            # Transfer ownership
+            success, message = await session_manager.transfer_ownership(
+                client, chat.id, user.id, session_data.get('password_hash')
+            )
+            
+            await client.disconnect()
+            
+            if success:
+                # Update database to mark as transferred
+                self.mark_group_as_transferred(group_info['id'], user.id)
+                
+                await update.message.reply_text(
+                    "✅ **Ownership Transfer Successful!**\n\n"
+                    "You now have admin rights in this group. "
+                    "The transfer is complete and the group is yours!",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Ownership transfer failed: {message}\n\n"
+                    "Please contact support if this issue persists.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in claim command: {e}")
+            await update.message.reply_text(
+                "❌ An error occurred during ownership transfer. Please try again or contact support.",
+                parse_mode=ParseMode.MARKDOWN
+            )
     
     async def list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /list command"""
@@ -1340,6 +1527,133 @@ Please enter the amount you want to withdraw:
         
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
         self.user_contexts[user.id] = {'state': 'waiting_withdraw_amount'}
+    
+    async def done_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /done command for finalizing group listing"""
+        user = update.effective_user
+        chat = update.effective_chat
+        
+        if chat.type not in ['group', 'supergroup']:
+            await update.message.reply_text(
+                "❌ This command can only be used in groups.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Check if user has a pending listing for this group
+        pending_listing = self.get_pending_listing(user.id, chat.id)
+        if not pending_listing:
+            await update.message.reply_text(
+                "❌ No pending listing found for this group.\n\n"
+                "Use `/list` first to start the listing process.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        await update.message.reply_text(
+            "🔄 **Verifying Group Ownership**\n\n"
+            "Checking if userbot has been granted ownership...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        try:
+            # Get userbot session (admin session for verification)
+            admin_sessions = db.get_user_sessions(BOT_OWNERS[0])  # Get admin sessions
+            if not admin_sessions:
+                await update.message.reply_text(
+                    "❌ No admin userbot sessions available. Please contact administrator.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            session_data = admin_sessions[0]  # Use first admin session
+            
+            # Create Telethon client
+            client = TelegramClient(
+                session=session_data['session_string'],
+                api_id=session_data['api_id'],
+                api_hash=session_data['api_hash']
+            )
+            
+            await client.connect()
+            
+            # Check if userbot is owner of the group
+            is_owner, owner_message = await session_manager.check_group_ownership(client, chat.id)
+            
+            if not is_owner:
+                await update.message.reply_text(
+                    f"❌ **Ownership Not Detected**\n\n"
+                    f"The userbot is not the owner of this group.\n\n"
+                    f"**Please ensure:**\n"
+                    f"• You added the userbot to the group\n"
+                    f"• You gave it admin rights with full permissions\n"
+                    f"• You transferred ownership to the userbot\n\n"
+                    f"Error: {owner_message}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                await client.disconnect()
+                return
+            
+            # Get detailed group information
+            group_info = await session_manager.get_group_info(client, chat.id)
+            await client.disconnect()
+            
+            if not group_info:
+                await update.message.reply_text(
+                    "❌ Unable to retrieve group information.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Validate group for listing
+            is_valid, validation_message = is_group_valid_for_listing(group_info)
+            if not is_valid:
+                await update.message.reply_text(
+                    f"❌ **Group Not Valid for Listing**\n\n"
+                    f"{validation_message}\n\n"
+                    f"Please fix the issue and try again.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                self.remove_pending_listing(user.id, chat.id)
+                return
+            
+            # Show group information for confirmation
+            buying_id = db.get_or_create_buying_id(chat.id)
+            
+            text = f"""
+✅ **Group Verification Successful!**
+
+**📋 Group Information:**
+**Group ID:** `{chat.id}`
+**Buying ID:** `{buying_id}`
+**Group Name:** {group_info['title']}
+**Creation Date:** {group_info['creation_date']}
+**Total Messages:** {group_info['total_messages']}
+**Price:** ${format_price(pending_listing['price'])} USDT
+
+**🔍 Validation Status:**
+✅ Private supergroup
+✅ Userbot has ownership
+✅ Minimum messages ({group_info['total_messages']} ≥ {MIN_GROUP_MESSAGES})
+✅ Creation date visible
+
+Do you want to confirm this listing?
+"""
+            
+            keyboard = create_confirmation_keyboard("listing", f"{chat.id}_{pending_listing['price']}")
+            
+            await update.message.reply_text(
+                text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in done command: {e}")
+            await update.message.reply_text(
+                "❌ An error occurred while verifying the group. Please try again.",
+                parse_mode=ParseMode.MARKDOWN
+            )
     
     # Admin Commands
     async def admin_help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1459,6 +1773,193 @@ You can get this from https://my.telegram.org
                 parse_mode=ParseMode.MARKDOWN
             )
     
+    async def import_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /import command"""
+        user = update.effective_user
+        
+        if user.id not in BOT_OWNERS:
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Please specify what to import.\n\n"
+                "**Usage:** `/import <type>`\n"
+                "**Types:** `sessions`, `users`, `groups`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        import_type = context.args[0].lower()
+        
+        if import_type == "sessions":
+            await update.message.reply_text(
+                "📁 **Import Sessions**\n\n"
+                "Please send a .session file to import it.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        elif import_type == "users":
+            await update.message.reply_text(
+                "👥 **Import Users**\n\n"
+                "Please send a JSON file with user data.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        elif import_type == "groups":
+            await update.message.reply_text(
+                "🏪 **Import Groups**\n\n"
+                "Please send a JSON file with group data.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Invalid import type.\n\n"
+                "**Available types:** `sessions`, `users`, `groups`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    async def export_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /export command"""
+        user = update.effective_user
+        
+        if user.id not in BOT_OWNERS:
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Please specify what to export.\n\n"
+                "**Usage:** `/export <type>`\n"
+                "**Types:** `users`, `groups`, `transactions`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        export_type = context.args[0].lower()
+        
+        try:
+            if export_type == "users":
+                await self.export_users_data(update, context)
+            elif export_type == "groups":
+                await self.export_groups_data(update, context)
+            elif export_type == "transactions":
+                await self.export_transactions_data(update, context)
+            else:
+                await update.message.reply_text(
+                    "❌ Invalid export type.\n\n"
+                    "**Available types:** `users`, `groups`, `transactions`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        except Exception as e:
+            logger.error(f"Error in export command: {e}")
+            await update.message.reply_text(
+                "❌ Export failed. Please try again.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    async def export_users_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Export users data"""
+        users = db.get_all_users(0, 1000)  # Get many users
+        
+        export_data = {
+            'export_type': 'users',
+            'export_date': datetime.now().isoformat(),
+            'total_users': len(users),
+            'users': users
+        }
+        
+        filename = f"users_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        filepath = f"/tmp/{filename}"
+        
+        with open(filepath, 'w') as f:
+            json.dump(export_data, f, indent=2)
+        
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=open(filepath, 'rb'),
+            filename=filename,
+            caption="👥 **Users Data Export**\n\nComplete users database export."
+        )
+        
+        os.remove(filepath)
+    
+    async def export_groups_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Export groups data"""
+        # Get all groups from database
+        with db.lock:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM groups')
+            groups_raw = cursor.fetchall()
+            
+            # Get column names
+            cursor.execute('PRAGMA table_info(groups)')
+            columns = [row[1] for row in cursor.fetchall()]
+            conn.close()
+        
+        groups = []
+        for row in groups_raw:
+            group_dict = dict(zip(columns, row))
+            groups.append(group_dict)
+        
+        export_data = {
+            'export_type': 'groups',
+            'export_date': datetime.now().isoformat(),
+            'total_groups': len(groups),
+            'groups': groups
+        }
+        
+        filename = f"groups_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        filepath = f"/tmp/{filename}"
+        
+        with open(filepath, 'w') as f:
+            json.dump(export_data, f, indent=2)
+        
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=open(filepath, 'rb'),
+            filename=filename,
+            caption="🏪 **Groups Data Export**\n\nComplete groups database export."
+        )
+        
+        os.remove(filepath)
+    
+    async def export_transactions_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Export transactions data"""
+        with db.lock:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM transactions ORDER BY created_at DESC LIMIT 1000')
+            transactions_raw = cursor.fetchall()
+            
+            cursor.execute('PRAGMA table_info(transactions)')
+            columns = [row[1] for row in cursor.fetchall()]
+            conn.close()
+        
+        transactions = []
+        for row in transactions_raw:
+            transaction_dict = dict(zip(columns, row))
+            transactions.append(transaction_dict)
+        
+        export_data = {
+            'export_type': 'transactions',
+            'export_date': datetime.now().isoformat(),
+            'total_transactions': len(transactions),
+            'transactions': transactions
+        }
+        
+        filename = f"transactions_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        filepath = f"/tmp/{filename}"
+        
+        with open(filepath, 'w') as f:
+            json.dump(export_data, f, indent=2)
+        
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=open(filepath, 'rb'),
+            filename=filename,
+            caption="💳 **Transactions Data Export**\n\nRecent transactions export (last 1000)."
+        )
+        
+        os.remove(filepath)
+    
     # Callback Query Handlers
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline keyboard callbacks"""
@@ -1558,6 +2059,8 @@ Select a price range to view groups:
             await self.handle_code_input(update, context)
         elif state == 'waiting_password':
             await self.handle_password_input(update, context)
+        elif state == 'waiting_import_password':
+            await self.handle_import_password_input(update, context)
     
     async def handle_price_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle price input for listing"""
@@ -1578,6 +2081,9 @@ Select a price range to view groups:
         user_context = self.user_contexts[user.id]
         user_context['price'] = price
         
+        # Add pending listing
+        self.add_pending_listing(user.id, user_context['chat_id'], price)
+        
         text = f"""
 ✅ **Price Set:** ${format_price(price)} USDT
 
@@ -1589,10 +2095,12 @@ Now, please add one of our userbots to your group as admin with full rights:
 **Steps:**
 1. Add the userbot to your group
 2. Give it admin rights with full permissions
-3. Wait up to 5 minutes for verification
+3. Transfer ownership to the userbot
 4. Type `/done` when completed
 
 **⏰ Timeout:** 5 minutes
+
+**Important:** The userbot must become the owner (not just admin) for the listing to work.
 """
         
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -1829,22 +2337,204 @@ You will be notified when it's processed.
         
         del self.user_contexts[user.id]
     
+    async def handle_import_password_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle password input for session import"""
+        user = update.effective_user
+        password_input = update.message.text.strip()
+        
+        user_context = self.user_contexts[user.id]
+        session_file = user_context['session_file']
+        
+        password = None if password_input.lower() == 'skip' else password_input
+        
+        try:
+            # Import the session file
+            success, message = await session_manager.import_session_file(
+                user.id, session_file, password
+            )
+            
+            if success:
+                await update.message.reply_text(
+                    "✅ **Session Imported Successfully!**\n\n"
+                    "The session file has been imported and is ready to use.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Session import failed: {message}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            
+            # Clean up temporary file
+            try:
+                os.remove(session_file)
+            except:
+                pass
+                
+        except Exception as e:
+            logger.error(f"Error importing session: {e}")
+            await update.message.reply_text(
+                "❌ An error occurred during session import.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        
+        del self.user_contexts[user.id]
+    
     # Payment Detection
     async def handle_tip_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle tip messages from cctip bot"""
+        """Handle tip messages from cctip bot with balance updates"""
         message = update.message
         
+        # Double-check security: only from CCTIP bot in bank group
         if (message.from_user.id != CCTIP_BOT_ID or 
             message.chat.id != BANK_GROUP_ID):
+            logger.warning(f"Tip message from wrong source: user_id={message.from_user.id}, chat_id={message.chat.id}")
             return
         
         tip_info = parse_tip_message(message.text)
         
         if not tip_info or not tip_info['valid']:
+            logger.info(f"Invalid tip message format: {message.text}")
             return
         
-        # Note: Real implementation would need proper user extraction from tip message
-        logger.info(f"Tip detected: {tip_info['amount']} USDT")
+        # Extract recipient user information from the message
+        recipient_info = self.extract_recipient_from_tip(message.text, message.entities or [])
+        
+        if not recipient_info:
+            logger.warning(f"Could not extract recipient from tip message: {message.text}")
+            return
+        
+        recipient_user_id = recipient_info.get('user_id')
+        if not recipient_user_id:
+            logger.warning(f"No user ID found in tip message")
+            return
+        
+        # Update user balance
+        success = db.update_user_balance(recipient_user_id, tip_info['amount'], 'tip')
+        
+        if success:
+            logger.info(f"Balance updated: User {recipient_user_id} +${tip_info['amount']} USDT")
+            
+            # Notify user about balance update
+            try:
+                new_balance = db.get_user_balance(recipient_user_id)
+                await context.bot.send_message(
+                    chat_id=recipient_user_id,
+                    text=f"💰 **Balance Updated!**\n\n"
+                         f"**Received:** +${format_balance(tip_info['amount'])} USDT\n"
+                         f"**New Balance:** ${format_balance(new_balance)} USDT\n\n"
+                         f"Thank you for your payment!",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify user {recipient_user_id} about balance update: {e}")
+        else:
+            logger.error(f"Failed to update balance for user {recipient_user_id}")
+    
+    def extract_recipient_from_tip(self, message_text: str, entities: List) -> Optional[Dict]:
+        """Extract recipient information from tip message"""
+        try:
+            # Look for user mention in entities
+            for entity in entities:
+                if entity.type == 'text_mention' and entity.user:
+                    # Direct user mention
+                    return {'user_id': entity.user.id, 'username': entity.user.username}
+                elif entity.type == 'mention':
+                    # Username mention (@username)
+                    start = entity.offset
+                    end = start + entity.length
+                    username = message_text[start:end].replace('@', '')
+                    
+                    # Look up user by username in database
+                    user_id = self.get_user_id_by_username(username)
+                    if user_id:
+                        return {'user_id': user_id, 'username': username}
+            
+            # Fallback: parse from message text patterns
+            patterns = [
+                r'tipped\s+@(\w+)',
+                r'💰.*?@(\w+).*?tipped',
+                r'tipped.*?@(\w+)'
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, message_text, re.IGNORECASE)
+                if match:
+                    username = match.group(1)
+                    user_id = self.get_user_id_by_username(username)
+                    if user_id:
+                        return {'user_id': user_id, 'username': username}
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting recipient from tip: {e}")
+            return None
+    
+    def get_user_id_by_username(self, username: str) -> Optional[int]:
+        """Get user ID by username from database"""
+        with db.lock:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT user_id FROM users WHERE username = ?', (username,))
+            result = cursor.fetchone()
+            conn.close()
+            return result[0] if result else None
+    
+    # Document Handler for Session Import
+    async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle document uploads (for session import)"""
+        user = update.effective_user
+        
+        if user.id not in BOT_OWNERS:
+            await update.message.reply_text(
+                "❌ Only bot administrators can import session files.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        document = update.message.document
+        
+        if not document.file_name.endswith('.session'):
+            await update.message.reply_text(
+                "❌ Please send a valid .session file.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        await update.message.reply_text(
+            "📁 **Session File Received**\n\n"
+            "Processing session file...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        try:
+            # Download the file
+            file = await context.bot.get_file(document.file_id)
+            file_path = f"/tmp/{document.file_name}"
+            await file.download_to_drive(file_path)
+            
+            # Ask for 2FA password if needed
+            text = """
+📁 **Session File Downloaded**
+
+If this session has 2-step verification enabled, please enter the password.
+If not, type `skip`:
+"""
+            
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            
+            self.user_contexts[user.id] = {
+                'state': 'waiting_import_password',
+                'session_file': file_path
+            }
+            
+        except Exception as e:
+            logger.error(f"Error handling session file: {e}")
+            await update.message.reply_text(
+                "❌ Failed to process session file. Please try again.",
+                parse_mode=ParseMode.MARKDOWN
+            )
 
 # ============================================================================
 # MAIN BOT CLASS
@@ -1870,6 +2560,7 @@ class TelegramMarketBot:
         app.add_handler(CommandHandler("refund", bot_commands.refund_command))
         app.add_handler(CommandHandler("cprice", bot_commands.cprice_command))
         app.add_handler(CommandHandler("withdraw", bot_commands.withdraw_command))
+        app.add_handler(CommandHandler("done", bot_commands.done_command))
         
         # Admin Commands
         app.add_handler(CommandHandler("ahelp", bot_commands.admin_help_command))
@@ -1877,6 +2568,8 @@ class TelegramMarketBot:
         app.add_handler(CommandHandler("add_bank", bot_commands.add_session_command))
         app.add_handler(CommandHandler("users", bot_commands.users_command))
         app.add_handler(CommandHandler("add_bal", bot_commands.add_balance_command))
+        app.add_handler(CommandHandler("import", bot_commands.import_command))
+        app.add_handler(CommandHandler("export", bot_commands.export_command))
         
         # Callback Query Handler
         app.add_handler(CallbackQueryHandler(bot_commands.handle_callback_query))
@@ -1885,6 +2578,12 @@ class TelegramMarketBot:
         app.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND, 
             bot_commands.handle_text_message
+        ))
+        
+        # Document Handler (for session imports)
+        app.add_handler(MessageHandler(
+            filters.Document.ALL, 
+            bot_commands.handle_document
         ))
         
         # Tip Detection Handler
