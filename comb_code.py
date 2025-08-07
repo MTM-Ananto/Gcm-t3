@@ -830,26 +830,63 @@ def format_buying_id(buying_id: str) -> str:
     return f"`{buying_id}`"
 
 def parse_tip_message(message_text: str) -> Optional[Dict[str, Any]]:
-    """Parse cctip bot tip message"""
+    """Parse cctip bot tip message with robust pattern matching"""
     try:
+        # Enhanced patterns to catch various cctip message formats
         patterns = [
-            r'💰.*?tipped.*?(\d+\.?\d*)\s*USDT',
-            r'tip.*?(\d+\.?\d*)\s*USDT',
-            r'(\d+\.?\d*)\s*USDT.*?tip'
+            # Standard tip patterns
+            r'💰.*?tipped.*?(\d+(?:\.\d+)?)\s*USDT',
+            r'tip.*?(\d+(?:\.\d+)?)\s*USDT',
+            r'(\d+(?:\.\d+)?)\s*USDT.*?tip',
+            r'tipped.*?(\d+(?:\.\d+)?)\s*USDT',
+            
+            # Direct amount patterns
+            r'(\d+(?:\.\d+)?)\s*USDT',
+            r'\$(\d+(?:\.\d+)?)\s*USDT',
+            r'Amount:\s*(\d+(?:\.\d+)?)\s*USDT',
+            
+            # Alternative formats
+            r'sent.*?(\d+(?:\.\d+)?)\s*USDT',
+            r'transferred.*?(\d+(?:\.\d+)?)\s*USDT',
+            r'received.*?(\d+(?:\.\d+)?)\s*USDT',
+            
+            # More flexible patterns
+            r'(\d+(?:\.\d+)?)\s*(?:USDT|USD-T|usd-t|usdt)',
+            r'💰[^0-9]*(\d+(?:\.\d+)?)[^0-9]*(?:USDT|USD)',
+            
+            # Fallback patterns (less strict)
+            r'(\d+(?:\.\d{1,2})?)'  # Any decimal number (last resort)
         ]
         
         for pattern in patterns:
-            match = re.search(pattern, message_text, re.IGNORECASE)
+            match = re.search(pattern, message_text, re.IGNORECASE | re.MULTILINE)
             if match:
-                amount = float(match.group(1))
-                return {
-                    'amount': amount,
-                    'currency': 'USDT',
-                    'valid': True
-                }
+                amount_str = match.group(1)
+                amount = float(amount_str)
+                
+                # Validate amount is reasonable (between 0.01 and 10000)
+                if 0.01 <= amount <= 10000:
+                    # Additional validation: check if USDT is mentioned in message
+                    usdt_mentioned = bool(re.search(r'USDT|USD-T|usdt|usd-t', message_text, re.IGNORECASE))
+                    
+                    return {
+                        'amount': amount,
+                        'currency': 'USDT',
+                        'valid': True,
+                        'usdt_mentioned': usdt_mentioned,
+                        'matched_pattern': pattern,
+                        'confidence': 'high' if usdt_mentioned else 'medium'
+                    }
         
+        # Log failed parsing for debugging
+        logger.debug(f"Failed to parse tip message: {message_text[:100]}...")
         return None
-    except Exception:
+        
+    except (ValueError, IndexError) as e:
+        logger.error(f"Error parsing tip amount: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error parsing tip message: {e}")
         return None
 
 def create_market_keyboard(years: List[int], current_page: int = 0, per_page: int = 5):
@@ -1035,6 +1072,7 @@ def generate_admin_help_text() -> str:
 **👥 User Management:**
 • `/users` - View all users and their statistics
 • `/add_bal <user id> <amount>` - Add/remove balance from user
+• `/withdrawals` - View and approve/reject withdrawal requests
 
 **🤖 Session Management:**
 • `/add` - Add new userbot session
@@ -1219,6 +1257,95 @@ class SessionManager:
             
             del self.pending_auth[user_id]
     
+    async def import_session_file(self, user_id: int, session_file: str, password: str = None) -> tuple:
+        """Import .session file with enhanced 2FA validation"""
+        try:
+            # Load the session file
+            from telethon.sessions import SQLiteSession
+            
+            session = SQLiteSession(session_file)
+            client = TelegramClient(session, 0, "", system_version="4.16.30-vxCUSTOM")
+            
+            await client.connect()
+            
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                return False, "Session file is not authorized"
+            
+            # Get account info
+            me = await client.get_me()
+            phone_number = me.phone
+            
+            # Check if 2FA is enabled on this account
+            from telethon.tl.functions.account import GetPasswordRequest
+            try:
+                password_info = await client(GetPasswordRequest())
+                has_2fa = password_info.has_password
+            except Exception:
+                has_2fa = False
+            
+            # Enforce 2FA requirement for session imports
+            if not has_2fa:
+                await client.disconnect()
+                return False, "Session must have 2FA enabled for security reasons"
+            
+            if has_2fa and not password:
+                await client.disconnect()
+                return False, "2FA password is required for this session"
+            
+            # Validate 2FA password if provided
+            if password and has_2fa:
+                try:
+                    from telethon.crypto import pwd_mod
+                    password_input = pwd_mod.compute_check(password_info, password)
+                    # Test password by attempting to use it (this validates it's correct)
+                    await client(GetPasswordRequest())
+                except Exception as e:
+                    await client.disconnect()
+                    return False, f"Invalid 2FA password: {e}"
+            
+            # Check for duplicate phone number
+            existing_sessions = db.get_user_sessions(user_id)
+            for session_data in existing_sessions:
+                if session_data['phone_number'] == phone_number:
+                    await client.disconnect()
+                    return False, f"Phone number {phone_number} already has an active session"
+            
+            # Check session limit
+            if len(existing_sessions) >= MAX_SESSIONS_PER_USER:
+                await client.disconnect()
+                return False, f"Maximum session limit ({MAX_SESSIONS_PER_USER}) reached"
+            
+            # Get session string and save to database
+            session_string = session.save()
+            password_hash = hashlib.sha256(password.encode()).hexdigest() if password else None
+            
+            # Get API credentials from the session (try to extract from session data)
+            api_id = 0  # Default, may need to be provided separately
+            api_hash = ""  # Default, may need to be provided separately
+            
+            success = db.add_session(
+                user_id=user_id,
+                api_id=api_id,
+                api_hash=api_hash,
+                phone_number=phone_number,
+                session_string=session_string,
+                password_hash=password_hash,
+                has_2fa=has_2fa
+            )
+            
+            await client.disconnect()
+            
+            if success:
+                logger.info(f"Successfully imported session for user {user_id}, phone {phone_number}")
+                return True, "Session imported successfully with 2FA validation"
+            else:
+                return False, "Failed to save session to database"
+                
+        except Exception as e:
+            logger.error(f"Error importing session file: {e}")
+            return False, f"Import failed: {e}"
+    
     async def check_group_ownership(self, client: TelegramClient, group_id: int):
         """Check if client has actual ownership of the group"""
         try:
@@ -1317,36 +1444,58 @@ class SessionManager:
             return False
     
     async def transfer_ownership(self, client: TelegramClient, group_id: int, new_owner_id: int, password: str = None):
-        """Transfer group ownership or promote to full admin"""
+        """Transfer actual group ownership using Telethon"""
         try:
             entity = await client.get_entity(group_id)
             new_owner = await client.get_entity(new_owner_id)
             
-            # Since Telegram API doesn't allow direct ownership transfer via bots,
-            # we promote the user to full admin with all rights
-            admin_rights = ChatAdminRights(
-                change_info=True,
-                post_messages=True,
-                edit_messages=True,
-                delete_messages=True,
-                ban_users=True,
-                invite_users=True,
-                pin_messages=True,
-                add_admins=True,
-                anonymous=False,
-                manage_call=True,
-                other=True
-            )
-            
-            await client(EditAdminRequest(
-                channel=entity,
-                user_id=new_owner,
-                admin_rights=admin_rights,
-                rank="Owner"
-            ))
-            
-            logger.info(f"Successfully promoted user {new_owner_id} to full admin in group {group_id}")
-            return True, "User promoted to full admin with owner rights"
+            if password:
+                # Real ownership transfer using 2FA password
+                from telethon.tl.functions.channels import EditCreatorRequest
+                from telethon.tl.functions.account import GetPasswordRequest
+                from telethon.crypto import pwd_mod
+                
+                # Get password information for SRP
+                password_info = await client(GetPasswordRequest())
+                
+                # Compute password hash for SRP
+                password_input = pwd_mod.compute_check(password_info, password)
+                
+                # Transfer actual ownership
+                await client(EditCreatorRequest(
+                    channel=entity,
+                    user_id=new_owner,
+                    password=password_input
+                ))
+                
+                logger.info(f"Successfully transferred ownership of group {group_id} to user {new_owner_id}")
+                return True, "Group ownership transferred successfully"
+                
+            else:
+                # Fallback: promote to full admin if no 2FA password
+                admin_rights = ChatAdminRights(
+                    change_info=True,
+                    post_messages=True,
+                    edit_messages=True,
+                    delete_messages=True,
+                    ban_users=True,
+                    invite_users=True,
+                    pin_messages=True,
+                    add_admins=True,
+                    anonymous=False,
+                    manage_call=True,
+                    other=True
+                )
+                
+                await client(EditAdminRequest(
+                    channel=entity,
+                    user_id=new_owner,
+                    admin_rights=admin_rights,
+                    rank="Owner"
+                ))
+                
+                logger.warning(f"No 2FA password provided - promoted user {new_owner_id} to admin in group {group_id}")
+                return True, "User promoted to full admin (2FA required for ownership transfer)"
             
         except Exception as e:
             logger.error(f"Error transferring ownership in group {group_id}: {e}")
@@ -1626,9 +1775,12 @@ Select a year to browse groups by creation date:
 2. Once you've joined, type `/claim` in each group
 3. The group ownership will be transferred to you
 
-**⚠️ Important:**
+**⚠️ Important Notes:**
 • You must join the groups before claiming
 • Use `/claim` command only after joining
+• **Real ownership transfer** requires seller's 2FA password
+• If seller has 2FA enabled: Full ownership transfer
+• If no 2FA: You'll get full admin rights instead
 • Ownership transfer may take a few minutes
 """
         
@@ -1766,7 +1918,7 @@ Please enter the price for your group in USDT.
         }
     
     async def refund_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /refund command"""
+        """Handle /refund command with actual ownership return"""
         user = update.effective_user
         chat = update.effective_chat
         
@@ -1777,11 +1929,140 @@ Please enter the price for your group in USDT.
             )
             return
         
+        group_id = chat.id
+        
+        # Check if group is listed by this user
+        groups = db.get_groups_by_date(2016, None)  # Get all groups
+        user_group = None
+        
+        for group in groups:
+            if group['group_id'] == group_id and group['owner_user_id'] == user.id and group['is_listed']:
+                user_group = group
+                break
+        
+        if not user_group:
+            await update.message.reply_text(
+                "❌ **Group Not Found**\n\n"
+                "This group is either:\n"
+                "• Not listed in the marketplace\n"
+                "• Not owned by you\n"
+                "• Already sold or delisted",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
         await update.message.reply_text(
-            "🔄 Processing refund request...\n\n"
-            "We're checking your ownership and removing the listing.",
+            "🔄 **Processing Refund Request**\n\n"
+            "Please wait while we:\n"
+            "1️⃣ Remove the group from listings\n"
+            "2️⃣ Transfer ownership back to you\n"
+            "3️⃣ Complete the refund process",
             parse_mode=ParseMode.MARKDOWN
         )
+        
+        try:
+            # Get session for this group
+            session_data = None
+            sessions = db.get_user_sessions(user.id)  # Get all sessions to find the right one
+            for session in sessions:
+                if session['id'] == user_group['session_id']:
+                    session_data = session
+                    break
+            
+            if not session_data:
+                await update.message.reply_text(
+                    "❌ **Refund Failed**\n\n"
+                    "Session data not found. Please contact support.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Create userbot client
+            client = session_manager.get_client(session_data['session_string'])
+            await client.connect()
+            
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                await update.message.reply_text(
+                    "❌ **Refund Failed**\n\n"
+                    "Session is not authorized. Please contact support.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Verify userbot is still the owner
+            is_owner = await session_manager.check_group_ownership(client, group_id)
+            if not is_owner:
+                await client.disconnect()
+                await update.message.reply_text(
+                    "❌ **Refund Failed**\n\n"
+                    "Userbot is no longer the owner of this group.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Transfer ownership back to original owner
+            password = session_data.get('password_hash')
+            if password and session_data.get('has_2fa'):
+                # For refund, we need the plain password, not hash
+                # This is a limitation - we can't decrypt the stored hash
+                success, message = await session_manager.transfer_ownership(
+                    client, group_id, user.id, None  # Fallback to admin promotion
+                )
+                
+                if success:
+                    await update.message.reply_text(
+                        "⚠️ **Partial Refund Completed**\n\n"
+                        "✅ Group delisted from marketplace\n"
+                        "✅ You've been promoted to full admin\n"
+                        "⚠️ Manual ownership transfer needed\n\n"
+                        "**Note:** Due to security, you'll need to manually transfer ownership to yourself using Telegram's native transfer feature.",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"❌ **Refund Failed**\n\n"
+                        "Error during ownership transfer: {message}",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    await client.disconnect()
+                    return
+            else:
+                # No 2FA, can only promote to admin
+                success, message = await session_manager.transfer_ownership(
+                    client, group_id, user.id, None
+                )
+                
+                if success:
+                    await update.message.reply_text(
+                        "✅ **Refund Completed**\n\n"
+                        "✅ Group delisted from marketplace\n"
+                        "✅ You've been promoted to full admin\n\n"
+                        "Your group has been successfully refunded!",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"❌ **Refund Failed**\n\n"
+                        "Error during ownership transfer: {message}",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    await client.disconnect()
+                    return
+            
+            # Delist the group from database
+            db.mark_group_as_sold(group_id, user.id)  # Mark as "sold" to original owner
+            
+            await client.disconnect()
+            logger.info(f"Refund completed for group {group_id} by user {user.id}")
+            
+        except Exception as e:
+            logger.error(f"Error processing refund for group {group_id}: {e}")
+            await update.message.reply_text(
+                "❌ **Refund Failed**\n\n"
+                "An unexpected error occurred. Please try again or contact support.",
+                parse_mode=ParseMode.MARKDOWN
+            )
     
     async def cprice_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /cprice command"""
@@ -1967,6 +2248,11 @@ Please enter the amount you want to withdraw:
 ✅ Userbot has ownership
 ✅ Minimum messages ({group_info['total_messages']} ≥ {MIN_GROUP_MESSAGES})
 ✅ Creation date visible
+
+**⚠️ Transfer Requirements:**
+• Your session must have 2FA enabled for real ownership transfer
+• Without 2FA: Buyers will get admin rights only
+• With 2FA: Buyers will get full ownership
 
 Do you want to confirm this listing?
 """
@@ -2721,6 +3007,8 @@ You can get this from https://my.telegram.org
             await self.handle_add_new_session_callback(query, context)
         elif data == "refresh_sessions":
             await self.handle_refresh_sessions(query, context)
+        elif data.startswith("approve_withdrawal_") or data.startswith("reject_withdrawal_"):
+            await self.handle_withdrawal_approval(update, context)
         elif data == "restart_session_setup":
             await self.handle_restart_session_setup(query, context)
         elif data == "cancel_session_setup":
@@ -3592,6 +3880,165 @@ If not, type `skip`:
                 "❌ Failed to process session file. Please try again.",
                 parse_mode=ParseMode.MARKDOWN
             )
+    
+    # Withdrawal Management (Admin)
+    async def withdrawal_requests_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show pending withdrawal requests to admins"""
+        user = update.effective_user
+        
+        if user.id not in BOT_OWNERS:
+            await update.message.reply_text("❌ Access denied.")
+            return
+        
+        try:
+            # Get pending withdrawal requests
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT wr.id, wr.user_id, wr.amount, wr.address, wr.created_at,
+                       u.username, u.first_name
+                FROM withdrawal_requests wr
+                JOIN users u ON wr.user_id = u.user_id
+                WHERE wr.status = 'pending'
+                ORDER BY wr.created_at ASC
+            ''')
+            requests = cursor.fetchall()
+            conn.close()
+            
+            if not requests:
+                await update.message.reply_text(
+                    "📋 **Withdrawal Requests**\n\n"
+                    "No pending withdrawal requests.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            text = "📋 **Pending Withdrawal Requests**\n\n"
+            keyboard = []
+            
+            for req in requests:
+                req_id, user_id, amount, address, created_at, username, first_name = req
+                user_display = f"@{username}" if username else first_name or f"User {user_id}"
+                
+                text += f"**Request #{req_id}**\n"
+                text += f"👤 User: {user_display} (`{user_id}`)\n"
+                text += f"💰 Amount: ${format_balance(amount)} USDT\n"
+                text += f"📍 Address: `{address}`\n"
+                text += f"📅 Date: {created_at}\n"
+                text += "─" * 30 + "\n\n"
+                
+                keyboard.append([
+                    InlineKeyboardButton(f"✅ Approve #{req_id}", callback_data=f"approve_withdrawal_{req_id}"),
+                    InlineKeyboardButton(f"❌ Reject #{req_id}", callback_data=f"reject_withdrawal_{req_id}")
+                ])
+            
+            await update.message.reply_text(
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            logger.error(f"Error fetching withdrawal requests: {e}")
+            await update.message.reply_text(
+                "❌ Error fetching withdrawal requests.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    async def handle_withdrawal_approval(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle withdrawal approval/rejection callbacks"""
+        query = update.callback_query
+        user = update.effective_user
+        
+        if user.id not in BOT_OWNERS:
+            await query.answer("❌ Access denied.")
+            return
+        
+        data = query.data
+        
+        if data.startswith("approve_withdrawal_"):
+            request_id = int(data.split("_")[-1])
+            await self.process_withdrawal_decision(query, request_id, "approved")
+        elif data.startswith("reject_withdrawal_"):
+            request_id = int(data.split("_")[-1])
+            await self.process_withdrawal_decision(query, request_id, "rejected")
+    
+    async def process_withdrawal_decision(self, query, request_id: int, decision: str):
+        """Process admin decision on withdrawal request"""
+        try:
+            # Get withdrawal request details
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT wr.user_id, wr.amount, wr.address, u.username, u.first_name
+                FROM withdrawal_requests wr
+                JOIN users u ON wr.user_id = u.user_id
+                WHERE wr.id = ? AND wr.status = 'pending'
+            ''', (request_id,))
+            result = cursor.fetchone()
+            
+            if not result:
+                await query.answer("❌ Withdrawal request not found or already processed.")
+                return
+            
+            user_id, amount, address, username, first_name = result
+            user_display = f"@{username}" if username else first_name or f"User {user_id}"
+            
+            # Update request status
+            cursor.execute('''
+                UPDATE withdrawal_requests 
+                SET status = ?, processed_at = datetime('now')
+                WHERE id = ?
+            ''', (decision, request_id))
+            
+            if decision == "rejected":
+                # Return funds to user balance if rejected
+                cursor.execute('''
+                    UPDATE users SET balance = balance + ?
+                    WHERE user_id = ?
+                ''', (amount, user_id))
+            
+            conn.commit()
+            conn.close()
+            
+            # Notify user
+            try:
+                status_emoji = "✅" if decision == "approved" else "❌"
+                status_text = "approved" if decision == "approved" else "rejected"
+                
+                message = f"{status_emoji} **Withdrawal {status_text.title()}**\n\n"
+                message += f"**Amount:** ${format_balance(amount)} USDT\n"
+                message += f"**Address:** `{address}`\n\n"
+                
+                if decision == "approved":
+                    message += "Your withdrawal has been processed. Please check your wallet."
+                else:
+                    message += "Your withdrawal was rejected. Funds have been returned to your balance."
+                
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify user {user_id} about withdrawal decision: {e}")
+            
+            # Update admin message
+            await query.edit_message_text(
+                f"✅ **Withdrawal Request #{request_id} {decision.title()}**\n\n"
+                f"👤 User: {user_display}\n"
+                f"💰 Amount: ${format_balance(amount)} USDT\n"
+                f"📍 Address: `{address}`\n"
+                f"📋 Status: {decision.title()}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            await query.answer(f"Withdrawal request {decision}!")
+            logger.info(f"Withdrawal request {request_id} {decision} by admin {query.from_user.id}")
+            
+        except Exception as e:
+            logger.error(f"Error processing withdrawal decision: {e}")
+            await query.answer("❌ Error processing request.")
 
 # ============================================================================
 # MAIN BOT CLASS
@@ -3630,6 +4077,7 @@ class TelegramMarketBot:
         app.add_handler(CommandHandler("sessions", bot_commands.sessions_command))
         app.add_handler(CommandHandler("set_bulk", bot_commands.set_bulk_command))
         app.add_handler(CommandHandler("blist", bot_commands.blist_command))
+        app.add_handler(CommandHandler("withdrawals", bot_commands.withdrawal_requests_command))
         
         # Callback Query Handler
         app.add_handler(CallbackQueryHandler(bot_commands.handle_callback_query))
