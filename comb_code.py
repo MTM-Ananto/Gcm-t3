@@ -192,6 +192,20 @@ class Database:
                 )
             ''')
             
+            # Bulk keywords table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS bulk_keywords (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    keyword TEXT NOT NULL,
+                    year INTEGER NOT NULL,
+                    month INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, keyword),
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
             conn.commit()
             conn.close()
     
@@ -547,6 +561,87 @@ class Database:
             result = cursor.fetchone()[0]
             conn.close()
             return result or 0.0
+    
+    def add_bulk_keyword(self, user_id: int, keyword: str, year: int, month: int = None) -> bool:
+        """Add or update a bulk keyword for user"""
+        with self.lock:
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT OR REPLACE INTO bulk_keywords (user_id, keyword, year, month)
+                    VALUES (?, ?, ?, ?)
+                ''', (user_id, keyword.lower(), year, month))
+                conn.commit()
+                conn.close()
+                return True
+            except Exception as e:
+                logger.error(f"Error adding bulk keyword: {e}")
+                return False
+    
+    def get_bulk_keyword(self, user_id: int, keyword: str) -> Optional[Dict]:
+        """Get bulk keyword details"""
+        with self.lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT keyword, year, month, created_at 
+                FROM bulk_keywords 
+                WHERE user_id = ? AND keyword = ?
+            ''', (user_id, keyword.lower()))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                return {
+                    'keyword': result[0],
+                    'year': result[1],
+                    'month': result[2],
+                    'created_at': result[3]
+                }
+            return None
+    
+    def get_user_bulk_keywords(self, user_id: int) -> List[Dict]:
+        """Get all bulk keywords for user"""
+        with self.lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT keyword, year, month, created_at 
+                FROM bulk_keywords 
+                WHERE user_id = ? 
+                ORDER BY created_at DESC
+            ''', (user_id,))
+            
+            keywords = []
+            for row in cursor.fetchall():
+                keywords.append({
+                    'keyword': row[0],
+                    'year': row[1],
+                    'month': row[2],
+                    'created_at': row[3]
+                })
+            
+            conn.close()
+            return keywords
+    
+    def delete_bulk_keyword(self, user_id: int, keyword: str) -> bool:
+        """Delete a bulk keyword"""
+        with self.lock:
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    DELETE FROM bulk_keywords 
+                    WHERE user_id = ? AND keyword = ?
+                ''', (user_id, keyword.lower()))
+                conn.commit()
+                conn.close()
+                return True
+            except Exception as e:
+                logger.error(f"Error deleting bulk keyword: {e}")
+                return False
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -1529,7 +1624,7 @@ Please enter the amount you want to withdraw:
         self.user_contexts[user.id] = {'state': 'waiting_withdraw_amount'}
     
     async def done_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /done command for finalizing group listing"""
+        """Handle /done command for finalizing group listing (regular or bulk)"""
         user = update.effective_user
         chat = update.effective_chat
         
@@ -1540,12 +1635,27 @@ Please enter the amount you want to withdraw:
             )
             return
         
-        # Check if user has a pending listing for this group
+        # Check for bulk listing first
+        bulk_listing = self.get_pending_bulk_listing(chat.id)
+        if bulk_listing:
+            # Validate that the user who started the bulk listing is using /done
+            if bulk_listing['user_id'] != user.id:
+                await update.message.reply_text(
+                    "❌ **Permission Denied**\n\n"
+                    "Only the user who started the bulk listing can use `/done`.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            await self.handle_bulk_done(update, context, bulk_listing)
+            return
+        
+        # Check if user has a regular pending listing for this group
         pending_listing = self.get_pending_listing(user.id, chat.id)
         if not pending_listing:
             await update.message.reply_text(
                 "❌ No pending listing found for this group.\n\n"
-                "Use `/list` first to start the listing process.",
+                "Use `/list` or `/blist <keyword>` first to start the listing process.",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -2032,6 +2142,338 @@ You can get this from https://my.telegram.org
             parse_mode=ParseMode.MARKDOWN
         )
     
+    async def set_bulk_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /set_bulk command to create keyword shortcuts"""
+        user = update.effective_user
+        
+        if not context.args or len(context.args) < 2:
+            # Show existing keywords
+            keywords = db.get_user_bulk_keywords(user.id)
+            
+            if not keywords:
+                await update.message.reply_text(
+                    "📝 **Bulk Listing Keywords**\n\n"
+                    "No keywords set yet.\n\n"
+                    "**Usage:** `/set_bulk <keyword> <year>` or `/set_bulk <keyword> <year+month>`\n\n"
+                    "**Examples:**\n"
+                    "• `/set_bulk old2020 2020` - Set keyword 'old2020' for year 2020\n"
+                    "• `/set_bulk jan2025 2025+1` - Set keyword 'jan2025' for January 2025\n"
+                    "• `/set_bulk summer 2024+7` - Set keyword 'summer' for July 2024",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            text = "📝 **Your Bulk Listing Keywords**\n\n"
+            for keyword in keywords:
+                if keyword['month']:
+                    month_names = [
+                        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+                    ]
+                    date_str = f"{month_names[keyword['month']-1]} {keyword['year']}"
+                else:
+                    date_str = str(keyword['year'])
+                
+                text += f"• **{keyword['keyword']}** → {date_str}\n"
+            
+            text += "\n**Usage:** `/set_bulk <keyword> <year>` or `/set_bulk <keyword> <year+month>`"
+            
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            return
+        
+        keyword = context.args[0].lower()
+        date_input = context.args[1]
+        
+        # Validate keyword
+        if not keyword.isalnum():
+            await update.message.reply_text(
+                "❌ **Invalid Keyword**\n\n"
+                "Keywords must contain only letters and numbers.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        if len(keyword) > 20:
+            await update.message.reply_text(
+                "❌ **Keyword Too Long**\n\n"
+                "Keywords must be 20 characters or less.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Parse date input
+        try:
+            if '+' in date_input:
+                # Year+Month format
+                year_str, month_str = date_input.split('+')
+                year = int(year_str)
+                month = int(month_str)
+                
+                if month < 1 or month > 12:
+                    raise ValueError("Invalid month")
+            else:
+                # Year only format
+                year = int(date_input)
+                month = None
+            
+            # Validate year
+            if year < 2016 or year > 2030:
+                await update.message.reply_text(
+                    "❌ **Invalid Year**\n\n"
+                    "Year must be between 2016 and 2030.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+                
+        except ValueError:
+            await update.message.reply_text(
+                "❌ **Invalid Date Format**\n\n"
+                "**Examples:**\n"
+                "• `2025` - For year 2025\n"
+                "• `2025+1` - For January 2025\n"
+                "• `2024+12` - For December 2024",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Save keyword
+        success = db.add_bulk_keyword(user.id, keyword, year, month)
+        
+        if success:
+            if month:
+                month_names = [
+                    "January", "February", "March", "April", "May", "June",
+                    "July", "August", "September", "October", "November", "December"
+                ]
+                date_str = f"{month_names[month-1]} {year}"
+            else:
+                date_str = str(year)
+            
+            await update.message.reply_text(
+                f"✅ **Keyword Set Successfully!**\n\n"
+                f"**Keyword:** `{keyword}`\n"
+                f"**Target Date:** {date_str}\n\n"
+                f"Now you can use `/blist {keyword}` for quick bulk listing!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Failed to save keyword. Please try again.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    async def blist_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /blist command for bulk listing"""
+        user = update.effective_user
+        chat = update.effective_chat
+        
+        if chat.type not in ['group', 'supergroup']:
+            await update.message.reply_text(
+                "❌ This command can only be used in groups.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "❌ **Missing Keyword**\n\n"
+                "**Usage:** `/blist <keyword>`\n\n"
+                "Use `/set_bulk` to create keywords first.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        keyword = context.args[0].lower()
+        
+        # Get keyword details
+        keyword_data = db.get_bulk_keyword(user.id, keyword)
+        if not keyword_data:
+            await update.message.reply_text(
+                f"❌ **Keyword Not Found**\n\n"
+                f"The keyword `{keyword}` doesn't exist.\n\n"
+                f"Use `/set_bulk {keyword} <year>` to create it first.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Check if user is the group owner/admin
+        try:
+            chat_member = await context.bot.get_chat_member(chat.id, user.id)
+            if chat_member.status not in ['creator', 'administrator']:
+                await update.message.reply_text(
+                    "❌ **Permission Denied**\n\n"
+                    "Only group owners and administrators can list groups.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+        except Exception as e:
+            logger.error(f"Error checking user permissions: {e}")
+            await update.message.reply_text(
+                "❌ Unable to verify your permissions in this group.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        if keyword_data['month']:
+            month_names = [
+                "January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December"
+            ]
+            date_str = f"{month_names[keyword_data['month']-1]} {keyword_data['year']}"
+        else:
+            date_str = str(keyword_data['year'])
+        
+        text = f"""
+📦 **Bulk Listing - {keyword.upper()}**
+
+**Target Date:** {date_str}
+**Group:** {chat.title}
+
+**Instructions:**
+1. Add our userbot to this group as admin
+2. Transfer group ownership to the userbot
+3. Type `/done` when ownership transfer is complete
+
+**⚠️ Important:**
+• You must transfer actual ownership (not just admin rights)
+• Only the original group owner should use `/done`
+• Group must meet listing requirements (private, 4+ messages, etc.)
+
+**Userbot to add:** @example_userbot
+"""
+        
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        
+        # Add to pending bulk listings
+        self.add_pending_bulk_listing(user.id, chat.id, keyword_data)
+    
+    def add_pending_bulk_listing(self, user_id: int, group_id: int, keyword_data: Dict):
+        """Add pending bulk listing"""
+        from datetime import datetime, timedelta
+        
+        # Store in user context for /done validation
+        if not hasattr(self, 'pending_bulk_listings'):
+            self.pending_bulk_listings = {}
+        
+        self.pending_bulk_listings[group_id] = {
+            'user_id': user_id,
+            'keyword_data': keyword_data,
+            'timestamp': datetime.now(),
+            'expires_at': datetime.now() + timedelta(minutes=10)
+        }
+    
+    def get_pending_bulk_listing(self, group_id: int) -> Optional[Dict]:
+        """Get pending bulk listing"""
+        if not hasattr(self, 'pending_bulk_listings'):
+            return None
+        
+        listing = self.pending_bulk_listings.get(group_id)
+        if listing and listing['expires_at'] > datetime.now():
+            return listing
+        elif listing:
+            # Remove expired listing
+            del self.pending_bulk_listings[group_id]
+        
+        return None
+    
+    async def handle_bulk_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE, bulk_listing: Dict):
+        """Handle /done for bulk listing"""
+        user = update.effective_user
+        chat = update.effective_chat
+        keyword_data = bulk_listing['keyword_data']
+        
+        await update.message.reply_text(
+            "🔄 **Verifying Bulk Listing**\n\n"
+            "Checking if userbot has been granted ownership...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        try:
+            # Get userbot session (admin session for verification)
+            admin_sessions = db.get_user_sessions(BOT_OWNERS[0])  # Get admin sessions
+            if not admin_sessions:
+                await update.message.reply_text(
+                    "❌ No admin userbot sessions available. Please contact administrator.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            session_data = admin_sessions[0]  # Use first admin session
+            
+            # Create Telethon client
+            client = TelegramClient(
+                session=session_data['session_string'],
+                api_id=session_data['api_id'],
+                api_hash=session_data['api_hash']
+            )
+            
+            await client.connect()
+            
+            # Check if userbot is owner of the group
+            is_owner, owner_message = await session_manager.check_group_ownership(client, chat.id)
+            
+            if not is_owner:
+                await update.message.reply_text(
+                    f"❌ **Ownership Not Detected**\n\n"
+                    f"The userbot is not the owner of this group.\n\n"
+                    f"**Please ensure:**\n"
+                    f"• You added the userbot to the group\n"
+                    f"• You gave it admin rights with full permissions\n"
+                    f"• You transferred ownership to the userbot\n\n"
+                    f"Error: {owner_message}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                await client.disconnect()
+                return
+            
+            # Get detailed group information
+            group_info = await session_manager.get_group_info(client, chat.id)
+            await client.disconnect()
+            
+            if not group_info:
+                await update.message.reply_text(
+                    "❌ Unable to retrieve group information.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Validate group for listing
+            is_valid, validation_message = is_group_valid_for_listing(group_info)
+            if not is_valid:
+                await update.message.reply_text(
+                    f"❌ **Group Not Valid for Listing**\n\n"
+                    f"{validation_message}\n\n"
+                    f"Please fix the issue and try again.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                # Remove pending bulk listing
+                if hasattr(self, 'pending_bulk_listings') and chat.id in self.pending_bulk_listings:
+                    del self.pending_bulk_listings[chat.id]
+                return
+            
+            # Create a fake price for the listing - in bulk mode, we need to ask for price
+            await update.message.reply_text(
+                "✅ **Group Ownership Verified!**\n\n"
+                "Now please enter the price for this group in USDT:",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Set user context for price input in bulk mode
+            self.user_contexts[user.id] = {
+                'state': 'waiting_bulk_price',
+                'chat_id': chat.id,
+                'chat_title': chat.title,
+                'keyword_data': keyword_data,
+                'group_info': group_info
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in bulk done command: {e}")
+            await update.message.reply_text(
+                "❌ An error occurred while verifying the group. Please try again.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
     # Callback Query Handlers
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline keyboard callbacks"""
@@ -2285,6 +2727,8 @@ You can get this from https://my.telegram.org
             await self.handle_password_input(update, context)
         elif state == 'waiting_import_password':
             await self.handle_import_password_input(update, context)
+        elif state == 'waiting_bulk_price':
+            await self.handle_bulk_price_input(update, context)
     
     async def handle_price_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle price input for listing"""
@@ -2682,6 +3126,86 @@ You will be notified when it's processed.
         
         del self.user_contexts[user.id]
     
+    async def handle_bulk_price_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle price input for bulk listing"""
+        user = update.effective_user
+        price_text = update.message.text.strip()
+        
+        user_context = self.user_contexts[user.id]
+        keyword_data = user_context['keyword_data']
+        group_info = user_context['group_info']
+        chat_id = user_context['chat_id']
+        
+        # Validate price
+        is_valid, price = validate_price(price_text)
+        if not is_valid:
+            await update.message.reply_text(
+                "❌ **Invalid Price**\n\n"
+                "Please enter a valid price between $0.01 and $99.99.\n"
+                "Examples: 10, 15.50, 99.99",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Generate buying ID
+        buying_id = db.get_or_create_buying_id(chat_id)
+        
+        # Set the creation date from keyword data
+        if keyword_data['month']:
+            # Specific month
+            creation_date = f"{keyword_data['year']}-{keyword_data['month']:02d}-01"
+        else:
+            # Year only - set to January 1st
+            creation_date = f"{keyword_data['year']}-01-01"
+        
+        # Show confirmation
+        if keyword_data['month']:
+            month_names = [
+                "January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December"
+            ]
+            date_str = f"{month_names[keyword_data['month']-1]} {keyword_data['year']}"
+        else:
+            date_str = str(keyword_data['year'])
+        
+        text = f"""
+✅ **Bulk Listing Ready for Confirmation**
+
+**📋 Group Information:**
+**Group ID:** `{chat_id}`
+**Buying ID:** `{buying_id}`
+**Group Name:** {group_info['title']}
+**Target Date:** {date_str} (from keyword: {keyword_data['keyword']})
+**Total Messages:** {group_info['total_messages']}
+**Price:** ${format_price(price)} USDT
+
+**🔍 Validation Status:**
+✅ Private supergroup
+✅ Userbot has ownership
+✅ Minimum messages ({group_info['total_messages']} ≥ {MIN_GROUP_MESSAGES})
+✅ Bulk keyword applied
+
+Do you want to confirm this bulk listing?
+"""
+        
+        keyboard = create_confirmation_keyboard("bulk_listing", f"{chat_id}_{price}_{keyword_data['keyword']}")
+        
+        await update.message.reply_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        # Store for confirmation
+        self.user_contexts[user.id] = {
+            'state': 'waiting_bulk_confirmation',
+            'chat_id': chat_id,
+            'price': price,
+            'keyword_data': keyword_data,
+            'group_info': group_info,
+            'creation_date': creation_date
+        }
+    
     # Payment Detection
     async def handle_tip_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle tip messages from cctip bot with balance updates"""
@@ -2873,6 +3397,8 @@ class TelegramMarketBot:
         app.add_handler(CommandHandler("import", bot_commands.import_command))
         app.add_handler(CommandHandler("export", bot_commands.export_command))
         app.add_handler(CommandHandler("sessions", bot_commands.sessions_command))
+        app.add_handler(CommandHandler("set_bulk", bot_commands.set_bulk_command))
+        app.add_handler(CommandHandler("blist", bot_commands.blist_command))
         
         # Callback Query Handler
         app.add_handler(CallbackQueryHandler(bot_commands.handle_callback_query))
