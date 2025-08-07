@@ -288,12 +288,19 @@ class Database:
                     conn.close()
                     return False
                 
-                # Check if phone number is already registered
-                cursor.execute('SELECT id FROM sessions WHERE phone_number = ? AND is_active = TRUE', (phone_number,))
-                if cursor.fetchone():
-                    logger.warning(f"Phone number {phone_number} already has an active session")
-                    conn.close()
-                    return False
+                # Check if phone number is already registered by ANY user
+                cursor.execute('SELECT user_id FROM sessions WHERE phone_number = ? AND is_active = TRUE', (phone_number,))
+                existing_session = cursor.fetchone()
+                if existing_session:
+                    existing_user_id = existing_session[0]
+                    if existing_user_id != user_id:
+                        logger.warning(f"Phone number {phone_number} already registered by different user {existing_user_id}")
+                        conn.close()
+                        return False
+                    else:
+                        logger.warning(f"Phone number {phone_number} already has an active session for this user")
+                        conn.close()
+                        return False
                 
                 # Check session limit per user
                 cursor.execute('SELECT COUNT(*) FROM sessions WHERE user_id = ? AND is_active = TRUE', (user_id,))
@@ -1023,17 +1030,20 @@ def generate_help_text() -> str:
 
 🏪 **Market Commands:**
 • `/market` - Browse groups by year/month
-• `/buy <buying_id>` - Purchase groups (e.g., `/buy G123ABC` or `/buy G123ABC, G456DEF`)
+• `/buy <buying_id>` - Purchase groups
+  Examples: `/buy G123ABC` (single group), `/buy G123ABC, G456DEF` (multiple groups)
 • `/claim` - Claim purchased groups (use in the group after joining)
 
 💰 **Balance Commands:**
 • `/balance` - Check your current balance
 • `/withdraw` - Withdraw funds to Polygon/CWallet
+  Example: `/withdraw` → Enter amount → Enter Polygon address/CWallet ID
 
 📋 **Listing Commands:**
 • `/list` - List your group for sale (use in the group you own)
 • `/refund` - Get refund for listed group (use in the group)
 • `/cprice <price>` - Change group price (use in the group)
+  Examples: `/cprice 25.50`, `/cprice 100.00`
 
 ❓ **Help:**
 • `/help` - Show this help message
@@ -1072,13 +1082,17 @@ def generate_admin_help_text() -> str:
 **👥 User Management:**
 • `/users` - View all users and their statistics
 • `/add_bal <user id> <amount>` - Add/remove balance from user
+  Examples: `/add_bal 123456789 50.00` (add $50), `/add_bal 123456789 -25.50` (remove $25.50)
 • `/withdrawals` - View and approve/reject withdrawal requests
 
 **🤖 Session Management:**
 • `/add` - Add new userbot session
+  Example: `/add` → Follow prompts for API ID, API Hash, phone, OTP, 2FA password
 • `/add_bank` - Add bank userbot for payment processing
 • `/import <type>` - Import bot data or sessions
+  Examples: `/import session`, `/import users`, `/import groups`
 • `/export <type>` - Export bot data or sessions
+  Examples: `/export session`, `/export users`, `/export groups`
 
 **📊 System Commands:**
 • `/ahelp` - Show this admin help
@@ -1156,9 +1170,12 @@ class SessionManager:
             
             me = await client.get_me()
             auth_data['me'] = me
-            auth_data['step'] = 'completed'
             
-            return True, "Code verified successfully"
+            # ENFORCE 2FA REQUIREMENT: If no SessionPasswordNeededError was raised,
+            # it means this account doesn't have 2FA enabled
+            auth_data['step'] = 'reject_no_2fa'
+            
+            return False, "This account must have 2-step verification enabled for security reasons"
             
         except SessionPasswordNeededError:
             auth_data['step'] = 'password'
@@ -1213,6 +1230,12 @@ class SessionManager:
             if 'password' in auth_data:
                 password_hash = self.hash_password(auth_data['password'])
                 has_2fa = True
+            
+            # ENFORCE 2FA REQUIREMENT: Block sessions without 2FA
+            if not has_2fa:
+                await client.disconnect()
+                del self.pending_auth[user_id]
+                return False, "Sessions without 2FA are not allowed for security reasons"
             
             success = db.add_session(
                 user_id=user_id,
@@ -1304,12 +1327,24 @@ class SessionManager:
                     await client.disconnect()
                     return False, f"Invalid 2FA password: {e}"
             
-            # Check for duplicate phone number
+            # Check for duplicate phone number across ALL users
             existing_sessions = db.get_user_sessions(user_id)
             for session_data in existing_sessions:
                 if session_data['phone_number'] == phone_number:
                     await client.disconnect()
-                    return False, f"Phone number {phone_number} already has an active session"
+                    return False, f"Phone number {phone_number} already has an active session for this user"
+            
+            # Also check if any OTHER user has this phone number
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT user_id FROM sessions WHERE phone_number = ? AND is_active = TRUE AND user_id != ?', 
+                          (phone_number, user_id))
+            other_user_session = cursor.fetchone()
+            conn.close()
+            
+            if other_user_session:
+                await client.disconnect()
+                return False, f"Phone number {phone_number} is already registered by another user"
             
             # Check session limit
             if len(existing_sessions) >= MAX_SESSIONS_PER_USER:
@@ -1570,6 +1605,41 @@ class BotCommands:
             ''', (new_owner_id, group_id))
             conn.commit()
             conn.close()
+    
+    def get_stored_password_for_transfer(self, group_id: int) -> Optional[str]:
+        """Get stored password for group transfer"""
+        try:
+            # CRITICAL LIMITATION: We cannot decrypt stored password hashes
+            # This is a fundamental security design issue that needs architectural fix
+            
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT s.password_hash, s.has_2fa 
+                FROM groups g
+                JOIN sessions s ON g.session_id = s.id
+                WHERE g.id = ?
+            ''', (group_id,))
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result and result[1]:  # has_2fa
+                # ARCHITECTURAL LIMITATION:
+                # We store password hashes for security, but need plain passwords for transfer
+                # SOLUTIONS for production:
+                # 1. During purchase, ask seller to re-enter password temporarily
+                # 2. Store it encrypted (not hashed) during transaction period
+                # 3. Use it for transfer then securely delete it
+                # 4. Or ask buyer to coordinate with seller for manual transfer
+                
+                logger.warning(f"Cannot auto-transfer ownership for group {group_id} - password is hashed")
+                return None
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting password for transfer: {e}")
+            return None
     
     def get_pending_listing(self, user_id: int, group_id: int) -> Optional[Dict]:
         """Get pending listing for user and group"""
@@ -1851,8 +1921,11 @@ Select a year to browse groups by creation date:
                 return
             
             # Transfer ownership
+            # Note: We need the plain password for ownership transfer, not the hash
+            # For purchased groups, we should have stored the password during purchase
+            password = self.get_stored_password_for_transfer(group_info['id'])
             success, message = await session_manager.transfer_ownership(
-                client, chat.id, user.id, session_data.get('password_hash')
+                client, chat.id, user.id, password
             )
             
             await client.disconnect()
@@ -1864,17 +1937,33 @@ Select a year to browse groups by creation date:
                 # Mark group as sold to prevent re-listing
                 db.mark_group_as_sold(chat.id, user.id)
                 
-                await update.message.reply_text(
-                    "✅ **Ownership Transfer Successful!**\n\n"
-                    "You now have admin rights in this group. "
-                    "The transfer is complete and the group is yours!\n\n"
-                    "🔒 This group is now permanently marked as sold and cannot be re-listed.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
+                if password and session_data.get('has_2fa'):
+                    await update.message.reply_text(
+                        "✅ **Full Ownership Transfer Successful!**\n\n"
+                        "🔰 You now have **complete ownership** of this group!\n"
+                        "✅ All owner privileges have been transferred to you\n"
+                        "✅ You can now manage admins, settings, and permissions\n\n"
+                        "🔒 This group is permanently marked as sold and cannot be re-listed.",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                else:
+                    await update.message.reply_text(
+                        "✅ **Admin Rights Transfer Successful!**\n\n"
+                        "👑 You now have **full admin rights** in this group!\n"
+                        "⚠️ Note: Full ownership transfer requires seller's 2FA\n"
+                        "✅ You have all admin permissions except ownership transfer\n\n"
+                        "🔒 This group is permanently marked as sold and cannot be re-listed.",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
             else:
                 await update.message.reply_text(
-                    f"❌ Ownership transfer failed: {message}\n\n"
-                    "Please contact support if this issue persists.",
+                    f"❌ **Transfer Failed**\n\n"
+                    f"**Error:** {message}\n\n"
+                    "**Possible solutions:**\n"
+                    "• Contact the seller for manual transfer\n"
+                    "• Try again in a few minutes\n"
+                    "• Contact support if this persists\n\n"
+                    "📞 Your purchase is valid - we'll help resolve this!",
                     parse_mode=ParseMode.MARKDOWN
                 )
                 
