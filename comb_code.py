@@ -1042,35 +1042,42 @@ def format_buying_id(buying_id: str) -> str:
     return f"`{buying_id}`"
 
 def parse_tip_message(message_text: str) -> Optional[Dict[str, Any]]:
-    """Parse cctip bot tip message with robust pattern matching"""
+    """Parse Cwallet/cctip bot tip message in exact format"""
     try:
-        # Enhanced patterns to catch various cctip message formats
-        patterns = [
-            # Standard tip patterns
-            r'💰.*?tipped.*?(\d+(?:\.\d+)?)\s*USDT',
+        # Exact Cwallet tip format: "Username tip details:\n\nUSDT +amount @recipient"
+        # Pattern matches: <username> tip details:\n\nUSDT +<amount> <recipient>
+        cwallet_pattern = r'tip details:\s*\n*\s*USDT\s*\+(\d+(?:\.\d+)?)\s+'
+        
+        match = re.search(cwallet_pattern, message_text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            amount_str = match.group(1)
+            amount = float(amount_str)
+            
+            # Validate amount is reasonable (between 0.01 and 10000)
+            if 0.01 <= amount <= 10000:
+                logger.info(f"Successfully parsed Cwallet tip: {amount} USDT")
+                return {
+                    'amount': amount,
+                    'currency': 'USDT',
+                    'valid': True,
+                    'usdt_mentioned': True,
+                    'matched_pattern': cwallet_pattern,
+                    'confidence': 'high'
+                }
+        
+        # Fallback patterns for other possible formats
+        fallback_patterns = [
+            # Alternative Cwallet formats
+            r'USDT\s*\+(\d+(?:\.\d+)?)',
             r'tip.*?(\d+(?:\.\d+)?)\s*USDT',
             r'(\d+(?:\.\d+)?)\s*USDT.*?tip',
-            r'tipped.*?(\d+(?:\.\d+)?)\s*USDT',
             
-            # Direct amount patterns
+            # Generic USDT patterns (lower confidence)
             r'(\d+(?:\.\d+)?)\s*USDT',
-            r'\$(\d+(?:\.\d+)?)\s*USDT',
-            r'Amount:\s*(\d+(?:\.\d+)?)\s*USDT',
-            
-            # Alternative formats
-            r'sent.*?(\d+(?:\.\d+)?)\s*USDT',
-            r'transferred.*?(\d+(?:\.\d+)?)\s*USDT',
-            r'received.*?(\d+(?:\.\d+)?)\s*USDT',
-            
-            # More flexible patterns
-            r'(\d+(?:\.\d+)?)\s*(?:USDT|USD-T|usd-t|usdt)',
-            r'💰[^0-9]*(\d+(?:\.\d+)?)[^0-9]*(?:USDT|USD)',
-            
-            # Fallback patterns (less strict)
-            r'(\d+(?:\.\d{1,2})?)'  # Any decimal number (last resort)
+            r'\+(\d+(?:\.\d+)?)\s*USDT',
         ]
         
-        for pattern in patterns:
+        for pattern in fallback_patterns:
             match = re.search(pattern, message_text, re.IGNORECASE | re.MULTILINE)
             if match:
                 amount_str = match.group(1)
@@ -1078,17 +1085,19 @@ def parse_tip_message(message_text: str) -> Optional[Dict[str, Any]]:
                 
                 # Validate amount is reasonable (between 0.01 and 10000)
                 if 0.01 <= amount <= 10000:
-                    # Additional validation: check if USDT is mentioned in message
+                    # Check if USDT is mentioned in message
                     usdt_mentioned = bool(re.search(r'USDT|USD-T|usdt|usd-t', message_text, re.IGNORECASE))
                     
-                    return {
-                        'amount': amount,
-                        'currency': 'USDT',
-                        'valid': True,
-                        'usdt_mentioned': usdt_mentioned,
-                        'matched_pattern': pattern,
-                        'confidence': 'high' if usdt_mentioned else 'medium'
-                    }
+                    if usdt_mentioned:
+                        logger.info(f"Parsed tip with fallback pattern: {amount} USDT")
+                        return {
+                            'amount': amount,
+                            'currency': 'USDT',
+                            'valid': True,
+                            'usdt_mentioned': True,
+                            'matched_pattern': pattern,
+                            'confidence': 'medium'
+                        }
         
         # Log failed parsing for debugging
         logger.debug(f"Failed to parse tip message: {message_text[:100]}...")
@@ -4646,9 +4655,14 @@ You will be notified when it's processed.
             logger.info(f"Invalid tip message format: {message.text}")
             return
         
-        # ENHANCED VALIDATION: Ensure USDT is mentioned
-        if not re.search(r'USDT|USD-T|usdt|usd-t', message.text, re.IGNORECASE):
-            logger.warning(f"Tip message does not contain USDT mention: {message.text}")
+        # ENHANCED VALIDATION: Ensure correct Cwallet format
+        # Must contain "tip details:" and "USDT +"
+        if not re.search(r'tip details:', message.text, re.IGNORECASE):
+            logger.debug(f"Message doesn't contain 'tip details:' - not a tip message")
+            return
+            
+        if not re.search(r'USDT\s*\+', message.text, re.IGNORECASE):
+            logger.debug(f"Message doesn't contain 'USDT +' - not a valid tip format")
             return
         
         # ENHANCED VALIDATION: Ensure user is tagged (via entities or @mention)
@@ -4659,8 +4673,11 @@ You will be notified when it's processed.
                     has_user_mention = True
                     break
         
-        if not has_user_mention and not re.search(r'@\w+', message.text):
-            logger.warning(f"Tip message does not contain user mention: {message.text}")
+        # Also check for username in text after USDT amount
+        has_recipient_in_text = bool(re.search(r'USDT\s*\+\d+(?:\.\d+)?\s+\w+', message.text, re.IGNORECASE))
+        
+        if not has_user_mention and not has_recipient_in_text:
+            logger.warning(f"Tip message does not contain user mention or recipient: {message.text}")
             return
         
         # Extract recipient user information from the message
@@ -4703,9 +4720,9 @@ You will be notified when it's processed.
             logger.error(f"Failed to update balance for user {recipient_user_id}")
     
     def extract_recipient_from_tip(self, message_text: str, entities: List) -> Optional[Dict]:
-        """Extract recipient information from tip message"""
+        """Extract recipient information from Cwallet tip message"""
         try:
-            # Look for user mention in entities
+            # Priority 1: Look for user mention in entities (most reliable)
             for entity in entities:
                 if entity.type == 'text_mention' and entity.user:
                     # Direct user mention
@@ -4721,21 +4738,52 @@ You will be notified when it's processed.
                     if user_id:
                         return {'user_id': user_id, 'username': username}
             
-            # Fallback: parse from message text patterns
-            patterns = [
-                r'tipped\s+@(\w+)',
-                r'💰.*?@(\w+).*?tipped',
-                r'tipped.*?@(\w+)'
+            # Priority 2: Parse Cwallet format "USDT +amount @recipient"
+            # Format: "Username tip details:\n\nUSDT +amount @recipient"
+            cwallet_pattern = r'USDT\s*\+\d+(?:\.\d+)?\s+@(\w+)|USDT\s*\+\d+(?:\.\d+)?\s+(\w+)'
+            match = re.search(cwallet_pattern, message_text, re.IGNORECASE)
+            if match:
+                # Check both groups for username
+                username = match.group(1) or match.group(2)
+                if username:
+                    user_id = self.get_user_id_by_username(username)
+                    if user_id:
+                        logger.info(f"Found recipient in Cwallet format: @{username} (ID: {user_id})")
+                        return {'user_id': user_id, 'username': username}
+            
+            # Priority 3: Look for recipient after USDT amount
+            amount_recipient_pattern = r'USDT\s*\+\d+(?:\.\d+)?\s+([^\s@]+)|USDT\s*\+\d+(?:\.\d+)?\s+@(\w+)'
+            match = re.search(amount_recipient_pattern, message_text, re.IGNORECASE)
+            if match:
+                # Check both groups for username
+                username = match.group(1) or match.group(2)
+                if username:
+                    # Remove any @ symbol
+                    username = username.replace('@', '')
+                    user_id = self.get_user_id_by_username(username)
+                    if user_id:
+                        logger.info(f"Found recipient after USDT amount: @{username} (ID: {user_id})")
+                        return {'user_id': user_id, 'username': username}
+            
+            # Priority 4: Fallback patterns for other possible formats
+            fallback_patterns = [
+                r'tip details:.*?@(\w+)',  # After tip details
+                r'@(\w+).*?USDT',          # Username before USDT
+                r'USDT.*?@(\w+)',          # Username after USDT
+                r'tipped\s+@(\w+)',        # Traditional tipped format
+                r'💰.*?@(\w+)',            # With money emoji
             ]
             
-            for pattern in patterns:
-                match = re.search(pattern, message_text, re.IGNORECASE)
+            for pattern in fallback_patterns:
+                match = re.search(pattern, message_text, re.IGNORECASE | re.DOTALL)
                 if match:
                     username = match.group(1)
                     user_id = self.get_user_id_by_username(username)
                     if user_id:
+                        logger.info(f"Found recipient with fallback pattern: @{username} (ID: {user_id})")
                         return {'user_id': user_id, 'username': username}
             
+            logger.warning(f"Could not extract recipient from message: {message_text[:100]}...")
             return None
             
         except Exception as e:
