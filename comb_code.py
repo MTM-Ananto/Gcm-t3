@@ -271,13 +271,35 @@ class Database:
     
     def add_session(self, user_id: int, api_id: int, api_hash: str, phone_number: str, 
                    session_string: str, password_hash: str = None, has_2fa: bool = False) -> bool:
+        """Add new session to database with enhanced security checks"""
         with self.lock:
             try:
                 conn = self.get_connection()
                 cursor = conn.cursor()
                 
-                cursor.execute('SELECT id FROM sessions WHERE phone_number = ?', (phone_number,))
+                # Security check: Validate password if 2FA is enabled
+                if has_2fa and not password_hash:
+                    logger.error("2FA enabled but no password hash provided")
+                    conn.close()
+                    return False
+                
+                if password_hash and not self.is_password_valid(password_hash):
+                    logger.error("Invalid password hash for session")
+                    conn.close()
+                    return False
+                
+                # Check if phone number is already registered
+                cursor.execute('SELECT id FROM sessions WHERE phone_number = ? AND is_active = TRUE', (phone_number,))
                 if cursor.fetchone():
+                    logger.warning(f"Phone number {phone_number} already has an active session")
+                    conn.close()
+                    return False
+                
+                # Check session limit per user
+                cursor.execute('SELECT COUNT(*) FROM sessions WHERE user_id = ? AND is_active = TRUE', (user_id,))
+                session_count = cursor.fetchone()[0]
+                if session_count >= MAX_SESSIONS_PER_USER:
+                    logger.warning(f"User {user_id} has reached maximum session limit")
                     conn.close()
                     return False
                 
@@ -289,10 +311,36 @@ class Database:
                 
                 conn.commit()
                 conn.close()
+                logger.info(f"Session added successfully for user {user_id}, phone {phone_number}")
                 return True
             except Exception as e:
                 logger.error(f"Error adding session: {e}")
                 return False
+    
+    def is_password_valid(self, password_hash: str) -> bool:
+        """Validate password hash meets security criteria"""
+        if not password_hash:
+            return False
+        
+        # Check if it's a valid SHA-256 hash (64 hex characters)
+        if len(password_hash) != 64:
+            return False
+        
+        try:
+            int(password_hash, 16)  # Try to parse as hexadecimal
+            return True
+        except ValueError:
+            return False
+    
+    def verify_session_ownership(self, session_id: int, user_id: int) -> bool:
+        """Verify that a session belongs to a specific user"""
+        with self.lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT user_id FROM sessions WHERE id = ? AND is_active = TRUE', (session_id,))
+            result = cursor.fetchone()
+            conn.close()
+            return result and result[0] == user_id
     
     def get_user_sessions(self, user_id: int) -> List[Dict]:
         with self.lock:
@@ -321,28 +369,56 @@ class Database:
             return sessions
     
     def get_or_create_buying_id(self, group_id: int) -> str:
+        """Get existing buying ID or create new one for group (permanent mapping)"""
         with self.lock:
             conn = self.get_connection()
             cursor = conn.cursor()
             
+            # Check if group already has a buying ID (permanent mapping)
             cursor.execute('SELECT buying_id FROM group_codes WHERE group_id = ?', (group_id,))
             result = cursor.fetchone()
             
             if result:
                 conn.close()
+                logger.info(f"Using existing buying ID {result[0]} for group {group_id}")
                 return result[0]
             
+            # Generate new buying ID
             while True:
                 buying_id = 'G' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
                 cursor.execute('SELECT group_id FROM group_codes WHERE buying_id = ?', (buying_id,))
                 if not cursor.fetchone():
                     break
             
+            # Store the new buying ID permanently
             cursor.execute('INSERT INTO group_codes (group_id, buying_id) VALUES (?, ?)', 
                           (group_id, buying_id))
             conn.commit()
             conn.close()
+            logger.info(f"Created new permanent buying ID {buying_id} for group {group_id}")
             return buying_id
+    
+    def mark_group_as_sold(self, group_id: int, buyer_id: int):
+        """Mark a group as sold to prevent re-listing"""
+        with self.lock:
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                
+                # Update group status
+                cursor.execute('''
+                    UPDATE groups 
+                    SET is_listed = FALSE, sold_to = ?, sold_at = datetime('now')
+                    WHERE group_id = ?
+                ''', (buyer_id, group_id))
+                
+                conn.commit()
+                conn.close()
+                logger.info(f"Group {group_id} marked as sold to user {buyer_id}")
+                return True
+            except Exception as e:
+                logger.error(f"Error marking group as sold: {e}")
+                return False
     
     def add_group(self, group_id: int, group_name: str, group_username: str, invite_link: str,
                   owner_user_id: int, session_id: int, price: float, creation_date: str,
@@ -1142,6 +1218,139 @@ class SessionManager:
                     pass
             
             del self.pending_auth[user_id]
+    
+    async def check_group_ownership(self, client: TelegramClient, group_id: int):
+        """Check if client has actual ownership of the group"""
+        try:
+            # Get chat entity and verify it's a supergroup
+            entity = await client.get_entity(group_id)
+            
+            # Verify it's a supergroup
+            if not hasattr(entity, 'megagroup') or not entity.megagroup:
+                return False, "Group is not a supergroup"
+            
+            # Verify it's private
+            if hasattr(entity, 'username') and entity.username:
+                return False, "Group is not private (has username)"
+            
+            # Get admin participants
+            participants = await client.get_participants(entity, limit=50, filter=ChannelParticipantsAdmins)
+            
+            me = await client.get_me()
+            
+            for participant in participants:
+                if participant.id == me.id:
+                    # Check if we're the creator
+                    if hasattr(participant, 'participant'):
+                        if participant.participant.__class__.__name__ == 'ChannelParticipantCreator':
+                            logger.info(f"Userbot is creator of group {group_id}")
+                            return True, "Userbot is group creator"
+                        
+                        # Check for full admin rights
+                        if hasattr(participant.participant, 'admin_rights'):
+                            admin_rights = participant.participant.admin_rights
+                            if (admin_rights.add_admins and admin_rights.ban_users and 
+                                admin_rights.delete_messages and admin_rights.invite_users and
+                                admin_rights.change_info and admin_rights.pin_messages):
+                                logger.info(f"Userbot has full admin rights in group {group_id}")
+                                return True, "Userbot has full admin rights"
+                    
+            return False, "Userbot does not have ownership rights"
+            
+        except Exception as e:
+            logger.error(f"Error checking group ownership for {group_id}: {e}")
+            return False, f"Error checking ownership: {e}"
+    
+    async def get_group_info(self, client: TelegramClient, group_id: int):
+        """Get detailed group information"""
+        try:
+            entity = await client.get_entity(group_id)
+            
+            # Get message count
+            messages = await client.get_messages(entity, limit=1)
+            total_messages = messages.total if hasattr(messages, 'total') else 0
+            
+            # Get creation date
+            creation_date = entity.date.strftime('%Y-%m-%d') if hasattr(entity, 'date') and entity.date else None
+            
+            # Generate invite link if possible
+            invite_link = None
+            try:
+                result = await client(ExportChatInviteRequest(entity))
+                invite_link = result.link
+            except Exception as e:
+                logger.warning(f"Could not generate invite link: {e}")
+            
+            return {
+                'id': entity.id,
+                'title': entity.title,
+                'creation_date': creation_date,
+                'total_messages': total_messages,
+                'invite_link': invite_link,
+                'is_megagroup': hasattr(entity, 'megagroup') and entity.megagroup,
+                'has_username': hasattr(entity, 'username') and entity.username is not None
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting group info for {group_id}: {e}")
+            return None
+    
+    async def check_user_in_group(self, client: TelegramClient, group_id: int, user_id: int):
+        """Check if user is a member of the group"""
+        try:
+            entity = await client.get_entity(group_id)
+            
+            # Try to get the user as a participant
+            try:
+                participant = await client.get_participants(entity, search=str(user_id), limit=1)
+                return len(participant) > 0 and participant[0].id == user_id
+            except:
+                # Alternative method: try to get user entity from the group
+                try:
+                    await client.get_entity(user_id, entity)
+                    return True
+                except:
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error checking user {user_id} in group {group_id}: {e}")
+            return False
+    
+    async def transfer_ownership(self, client: TelegramClient, group_id: int, new_owner_id: int, password: str = None):
+        """Transfer group ownership or promote to full admin"""
+        try:
+            entity = await client.get_entity(group_id)
+            new_owner = await client.get_entity(new_owner_id)
+            
+            # Since Telegram API doesn't allow direct ownership transfer via bots,
+            # we promote the user to full admin with all rights
+            admin_rights = ChatAdminRights(
+                change_info=True,
+                post_messages=True,
+                edit_messages=True,
+                delete_messages=True,
+                ban_users=True,
+                invite_users=True,
+                pin_messages=True,
+                add_admins=True,
+                anonymous=False,
+                manage_call=True,
+                other=True
+            )
+            
+            await client(EditAdminRequest(
+                channel=entity,
+                user_id=new_owner,
+                admin_rights=admin_rights,
+                rank="Owner"
+            ))
+            
+            logger.info(f"Successfully promoted user {new_owner_id} to full admin in group {group_id}")
+            return True, "User promoted to full admin with owner rights"
+            
+        except Exception as e:
+            logger.error(f"Error transferring ownership in group {group_id}: {e}")
+            return False, f"Failed to transfer ownership: {e}"
 
 # ============================================================================
 # BOT COMMANDS
@@ -1446,6 +1655,14 @@ Select a year to browse groups by creation date:
             )
             return
         
+        # Verify the group appears in the bot's database
+        if not self.verify_group_in_database(chat.id):
+            await update.message.reply_text(
+                "❌ This group is not properly registered in our database. Please contact support.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
         await update.message.reply_text(
             "🔄 Processing ownership transfer...\n\n"
             "Verifying your membership and transferring ownership...",
@@ -1492,10 +1709,14 @@ Select a year to browse groups by creation date:
                 # Update database to mark as transferred
                 self.mark_group_as_transferred(group_info['id'], user.id)
                 
+                # Mark group as sold to prevent re-listing
+                db.mark_group_as_sold(chat.id, user.id)
+                
                 await update.message.reply_text(
                     "✅ **Ownership Transfer Successful!**\n\n"
                     "You now have admin rights in this group. "
-                    "The transfer is complete and the group is yours!",
+                    "The transfer is complete and the group is yours!\n\n"
+                    "🔒 This group is now permanently marked as sold and cannot be re-listed.",
                     parse_mode=ParseMode.MARKDOWN
                 )
             else:
@@ -3306,6 +3527,16 @@ Do you want to confirm this bulk listing?
             result = cursor.fetchone()
             conn.close()
             return result[0] if result else None
+    
+    def verify_group_in_database(self, group_id: int) -> bool:
+        """Verify that a group exists in the database"""
+        with db.lock:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT id FROM groups WHERE group_id = ?', (group_id,))
+            result = cursor.fetchone()
+            conn.close()
+            return result is not None
     
     # Document Handler for Session Import
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
