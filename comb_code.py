@@ -1920,13 +1920,46 @@ Select a year to browse groups by creation date:
                 await client.disconnect()
                 return
             
-            # Transfer ownership
-            # Note: We need the plain password for ownership transfer, not the hash
-            # For purchased groups, we should have stored the password during purchase
-            password = self.get_stored_password_for_transfer(group_info['id'])
-            success, message = await session_manager.transfer_ownership(
-                client, chat.id, user.id, password
-            )
+            # Transfer ownership using Telethon EditAdminRequest
+            # Since we can't decrypt stored password hashes, we promote to full admin
+            from telethon.tl.functions.channels import EditAdminRequest
+            from telethon.tl.types import ChatAdminRights
+            
+            try:
+                entity = await client.get_entity(chat.id)
+                new_owner = await client.get_entity(user.id)
+                
+                # Create full admin rights
+                admin_rights = ChatAdminRights(
+                    change_info=True,
+                    post_messages=True,
+                    edit_messages=True,
+                    delete_messages=True,
+                    ban_users=True,
+                    invite_users=True,
+                    pin_messages=True,
+                    add_admins=True,
+                    anonymous=False,
+                    manage_call=True,
+                    other=True
+                )
+                
+                # Promote buyer to full admin
+                await client(EditAdminRequest(
+                    channel=entity,
+                    user_id=new_owner,
+                    admin_rights=admin_rights,
+                    rank="Owner"
+                ))
+                
+                success = True
+                message = "User promoted to full admin with owner rights"
+                logger.info(f"Successfully transferred admin rights to user {user.id} in group {chat.id}")
+                
+            except Exception as e:
+                success = False
+                message = str(e)
+                logger.error(f"Error during ownership transfer: {e}")
             
             await client.disconnect()
             
@@ -1937,24 +1970,15 @@ Select a year to browse groups by creation date:
                 # Mark group as sold to prevent re-listing
                 db.mark_group_as_sold(chat.id, user.id)
                 
-                if password and session_data.get('has_2fa'):
-                    await update.message.reply_text(
-                        "✅ **Full Ownership Transfer Successful!**\n\n"
-                        "🔰 You now have **complete ownership** of this group!\n"
-                        "✅ All owner privileges have been transferred to you\n"
-                        "✅ You can now manage admins, settings, and permissions\n\n"
-                        "🔒 This group is permanently marked as sold and cannot be re-listed.",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                else:
-                    await update.message.reply_text(
-                        "✅ **Admin Rights Transfer Successful!**\n\n"
-                        "👑 You now have **full admin rights** in this group!\n"
-                        "⚠️ Note: Full ownership transfer requires seller's 2FA\n"
-                        "✅ You have all admin permissions except ownership transfer\n\n"
-                        "🔒 This group is permanently marked as sold and cannot be re-listed.",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
+                await update.message.reply_text(
+                    "✅ **Admin Rights Transfer Successful!**\n\n"
+                    "👑 You now have **full admin rights** in this group!\n"
+                    "✅ You have all admin permissions and \"Owner\" rank\n"
+                    "✅ You can manage admins, settings, and permissions\n"
+                    "⚠️ Note: True ownership transfer requires manual coordination with seller\n\n"
+                    "🔒 This group is permanently marked as sold and cannot be re-listed.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
             else:
                 await update.message.reply_text(
                     f"❌ **Transfer Failed**\n\n"
@@ -3821,6 +3845,23 @@ Do you want to confirm this bulk listing?
             logger.info(f"Invalid tip message format: {message.text}")
             return
         
+        # ENHANCED VALIDATION: Ensure USDT is mentioned
+        if not re.search(r'USDT|USD-T|usdt|usd-t', message.text, re.IGNORECASE):
+            logger.warning(f"Tip message does not contain USDT mention: {message.text}")
+            return
+        
+        # ENHANCED VALIDATION: Ensure user is tagged (via entities or @mention)
+        has_user_mention = False
+        if message.entities:
+            for entity in message.entities:
+                if entity.type in ['text_mention', 'mention']:
+                    has_user_mention = True
+                    break
+        
+        if not has_user_mention and not re.search(r'@\w+', message.text):
+            logger.warning(f"Tip message does not contain user mention: {message.text}")
+            return
+        
         # Extract recipient user information from the message
         recipient_info = self.extract_recipient_from_tip(message.text, message.entities or [])
         
@@ -3831,6 +3872,11 @@ Do you want to confirm this bulk listing?
         recipient_user_id = recipient_info.get('user_id')
         if not recipient_user_id:
             logger.warning(f"No user ID found in tip message")
+            return
+        
+        # ENHANCED VALIDATION: Only accept tips with high confidence
+        if tip_info.get('confidence') == 'medium' and not tip_info.get('usdt_mentioned'):
+            logger.warning(f"Low confidence tip parsing, rejecting: {message.text}")
             return
         
         # Update user balance
@@ -3929,13 +3975,20 @@ Do you want to confirm this bulk listing?
         
         document = update.message.document
         
-        if not document.file_name.endswith('.session'):
+        if document.file_name.endswith('.session'):
+            await self.handle_session_file_import(update, context, document)
+        elif document.file_name.endswith('.json'):
+            await self.handle_json_file_import(update, context, document)
+        else:
             await update.message.reply_text(
-                "❌ Please send a valid .session file.",
+                "❌ Please send a valid .session or .json file.",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
         
+    
+    async def handle_session_file_import(self, update: Update, context: ContextTypes.DEFAULT_TYPE, document):
+        """Handle .session file import"""
         await update.message.reply_text(
             "📁 **Session File Received**\n\n"
             "Processing session file...",
@@ -3958,7 +4011,7 @@ If not, type `skip`:
             
             await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
             
-            self.user_contexts[user.id] = {
+            self.user_contexts[update.effective_user.id] = {
                 'state': 'waiting_import_password',
                 'session_file': file_path
             }
@@ -3969,6 +4022,115 @@ If not, type `skip`:
                 "❌ Failed to process session file. Please try again.",
                 parse_mode=ParseMode.MARKDOWN
             )
+    
+    async def handle_json_file_import(self, update: Update, context: ContextTypes.DEFAULT_TYPE, document):
+        """Handle JSON file import for users/groups data"""
+        await update.message.reply_text(
+            "📄 **JSON File Received**\n\n"
+            "Processing import data...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        try:
+            # Download the file
+            file = await context.bot.get_file(document.file_id)
+            file_path = f"/tmp/{document.file_name}"
+            await file.download_to_drive(file_path)
+            
+            # Parse JSON file
+            with open(file_path, 'r') as f:
+                import_data = json.load(f)
+            
+            export_type = import_data.get('export_type', '').lower()
+            
+            if export_type == 'users':
+                await self.import_users_data(update, import_data)
+            elif export_type == 'groups':
+                await self.import_groups_data(update, import_data)
+            elif export_type == 'transactions':
+                await self.import_transactions_data(update, import_data)
+            else:
+                await update.message.reply_text(
+                    "❌ **Invalid JSON Format**\n\n"
+                    "Please send a valid export file with 'export_type' field.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            
+            # Clean up file
+            os.remove(file_path)
+            
+        except json.JSONDecodeError:
+            await update.message.reply_text(
+                "❌ **Invalid JSON File**\n\n"
+                "Please send a valid JSON file.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            logger.error(f"Error handling JSON file: {e}")
+            await update.message.reply_text(
+                "❌ Failed to process JSON file. Please try again.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    async def import_users_data(self, update: Update, import_data: dict):
+        """Import users data from JSON"""
+        users = import_data.get('users', [])
+        imported_count = 0
+        
+        for user_data in users:
+            try:
+                success = db.add_user(
+                    user_data.get('user_id'),
+                    user_data.get('username'),
+                    user_data.get('first_name')
+                )
+                if success:
+                    imported_count += 1
+            except Exception as e:
+                logger.error(f"Error importing user {user_data.get('user_id')}: {e}")
+        
+        await update.message.reply_text(
+            f"✅ **Users Import Complete**\n\n"
+            f"**Successfully imported:** {imported_count}/{len(users)} users",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def import_groups_data(self, update: Update, import_data: dict):
+        """Import groups data from JSON"""
+        groups = import_data.get('groups', [])
+        imported_count = 0
+        
+        for group_data in groups:
+            try:
+                success = db.add_group(
+                    group_data.get('group_id'),
+                    group_data.get('group_name'),
+                    group_data.get('group_username'),
+                    group_data.get('invite_link'),
+                    group_data.get('owner_user_id'),
+                    group_data.get('session_id'),
+                    group_data.get('price'),
+                    group_data.get('creation_date'),
+                    group_data.get('total_messages')
+                )
+                if success:
+                    imported_count += 1
+            except Exception as e:
+                logger.error(f"Error importing group {group_data.get('group_id')}: {e}")
+        
+        await update.message.reply_text(
+            f"✅ **Groups Import Complete**\n\n"
+            f"**Successfully imported:** {imported_count}/{len(groups)} groups",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def import_transactions_data(self, update: Update, import_data: dict):
+        """Import transactions data from JSON"""
+        await update.message.reply_text(
+            "⚠️ **Transaction Import Not Supported**\n\n"
+            "Transaction imports are restricted for security reasons.",
+            parse_mode=ParseMode.MARKDOWN
+        )
     
     # Withdrawal Management (Admin)
     async def withdrawal_requests_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
