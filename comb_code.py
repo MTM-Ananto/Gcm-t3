@@ -55,7 +55,7 @@ from config import (
     BOT_TOKEN, BOT_OWNERS, CCTIP_BOT_USERNAME, CCTIP_BOT_ID, BANK_GROUP_ID,
     DATABASE_URL, SESSIONS_DIR, MAX_SESSIONS_PER_USER, MIN_GROUP_MESSAGES,
     MIN_PRICE, MAX_PRICE, LISTING_TIMEOUT, GROUPS_PER_PAGE, USERS_PER_PAGE,
-    MIN_WITHDRAWAL
+    MIN_WITHDRAWAL, BUYING_FEE_RATE, SELLING_FEE_RATE
 )
 
 # ============================================================================
@@ -527,13 +527,13 @@ class Database:
                 }
             return None
     
-    def purchase_groups(self, user_id: int, buying_ids: List[str]) -> bool:
+    def purchase_groups(self, user_id: int, buying_ids: List[str], subtotal: float = None, buying_fee: float = None) -> bool:
         with self.lock:
             try:
                 conn = self.get_connection()
                 cursor = conn.cursor()
                 
-                total_cost = 0
+                calculated_subtotal = 0
                 group_data = []
                 for buying_id in buying_ids:
                     cursor.execute('SELECT price, group_id FROM groups WHERE buying_id = ? AND is_listed = TRUE', 
@@ -542,8 +542,13 @@ class Database:
                     if not result:
                         conn.close()
                         return False
-                    total_cost += result[0]
+                    calculated_subtotal += result[0]
                     group_data.append({'buying_id': buying_id, 'price': result[0], 'group_id': result[1]})
+                
+                # Use provided subtotal and fee, or calculate if not provided
+                final_subtotal = subtotal if subtotal is not None else calculated_subtotal
+                final_fee = buying_fee if buying_fee is not None else (calculated_subtotal * BUYING_FEE_RATE)
+                total_cost = final_subtotal + final_fee
                 
                 cursor.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,))
                 balance = cursor.fetchone()[0]
@@ -559,10 +564,18 @@ class Database:
                     cursor.execute('UPDATE groups SET is_listed = FALSE WHERE buying_id = ?', 
                                  (group['buying_id'],))
                 
+                # Record purchase transaction with fee breakdown
+                transaction_details = {
+                    'subtotal': final_subtotal,
+                    'buying_fee': final_fee,
+                    'total': total_cost,
+                    'group_ids': [g['group_id'] for g in group_data]
+                }
+                
                 cursor.execute('''
                     INSERT INTO transactions (user_id, transaction_type, amount, group_ids, status)
                     VALUES (?, 'purchase', ?, ?, 'completed')
-                ''', (user_id, -total_cost, json.dumps([g['group_id'] for g in group_data])))
+                ''', (user_id, -total_cost, json.dumps(transaction_details)))
                 
                 conn.commit()
                 conn.close()
@@ -1023,7 +1036,7 @@ def is_group_valid_for_listing(group_info: Dict) -> Tuple[bool, str]:
 
 def generate_help_text() -> str:
     """Generate user help text"""
-    return """
+    return f"""
 🤖 **Telegram Group Market Bot**
 
 **📱 Available Commands:**
@@ -1038,6 +1051,10 @@ def generate_help_text() -> str:
 • `/balance` - Check your current balance
 • `/withdraw` - Withdraw funds to Polygon/CWallet
   Example: `/withdraw` → Enter amount → Enter Polygon address/CWallet ID
+
+💳 **Fees:**
+• **Buying Fee:** {BUYING_FEE_RATE * 100:.1f}% added to purchase total
+• **Selling Fee:** {SELLING_FEE_RATE * 100:.1f}% deducted from seller earnings
 
 📋 **Listing Commands:**
 • `/list` - List your group for sale (use in the group you own)
@@ -1076,7 +1093,7 @@ Need more help? Contact the bot administrators.
 
 def generate_admin_help_text() -> str:
     """Generate admin help text"""
-    return """
+    return f"""
 🔧 **Admin Commands:**
 
 **👥 User Management:**
@@ -1109,6 +1126,11 @@ Withdrawal requests are automatically sent to admins for approval.
 • Bot owners are defined in config.py
 • Bank group ID is configurable
 • All settings can be modified in the config file
+
+**💳 Fee Configuration:**
+• **Buying Fee:** {BUYING_FEE_RATE * 100:.1f}% (configurable in config.py)
+• **Selling Fee:** {SELLING_FEE_RATE * 100:.1f}% (configurable in config.py)
+• Fees are automatically calculated and applied
 """
 
 # ============================================================================
@@ -1746,6 +1768,10 @@ Current Balance: **${format_balance(balance)} USDT**
 💳 **Add Balance:**
 Send USDT via @cctip_bot in the designated bank group to add funds to your account.
 
+💰 **Fees:**
+• **Buying Fee:** {BUYING_FEE_RATE * 100:.1f}% (added to purchase total)
+• **Selling Fee:** {SELLING_FEE_RATE * 100:.1f}% (deducted from your earnings)
+
 📊 **Transaction History:**
 Use the web dashboard for detailed transaction history.
 """
@@ -1788,7 +1814,7 @@ Select a year to browse groups by creation date:
             )
             return
         
-        total_cost = 0
+        subtotal = 0
         group_details = []
         
         for buying_id in buying_ids:
@@ -1800,13 +1826,19 @@ Select a year to browse groups by creation date:
                 )
                 return
             
-            total_cost += group['price']
+            subtotal += group['price']
             group_details.append(group)
+        
+        # Calculate buying fee
+        buying_fee = subtotal * BUYING_FEE_RATE
+        total_cost = subtotal + buying_fee
         
         user_balance = db.get_user_balance(user.id)
         if user_balance < total_cost:
             await update.message.reply_text(
                 f"❌ Insufficient balance.\n\n"
+                f"**Subtotal:** ${format_price(subtotal)} USDT\n"
+                f"**Buying Fee ({BUYING_FEE_RATE * 100:.1f}%):** ${format_price(buying_fee)} USDT\n"
                 f"**Total Cost:** ${format_price(total_cost)} USDT\n"
                 f"**Your Balance:** ${format_balance(user_balance)} USDT\n"
                 f"**Needed:** ${format_price(total_cost - user_balance)} USDT",
@@ -1814,7 +1846,7 @@ Select a year to browse groups by creation date:
             )
             return
         
-        success = db.purchase_groups(user.id, buying_ids)
+        success = db.purchase_groups(user.id, buying_ids, subtotal, buying_fee)
         
         if not success:
             await update.message.reply_text(
@@ -1826,6 +1858,8 @@ Select a year to browse groups by creation date:
         text = f"""
 ✅ **Purchase Successful!**
 
+**Subtotal:** ${format_price(subtotal)} USDT
+**Buying Fee ({BUYING_FEE_RATE * 100:.1f}%):** ${format_price(buying_fee)} USDT
 **Total Cost:** ${format_price(total_cost)} USDT
 **Remaining Balance:** ${format_balance(user_balance - total_cost)} USDT
 
@@ -1966,6 +2000,57 @@ Select a year to browse groups by creation date:
             if success:
                 # Update database to mark as transferred
                 self.mark_group_as_transferred(group_info['id'], user.id)
+                
+                # Pay seller with selling fee deduction
+                seller_id = group_info['owner_user_id']
+                group_price = group_info['price']
+                selling_fee = group_price * SELLING_FEE_RATE
+                seller_earnings = group_price - selling_fee
+                
+                # Credit seller's balance
+                success_payment = db.update_user_balance(seller_id, seller_earnings, 'sale')
+                
+                if success_payment:
+                    # Record selling transaction with fee
+                    transaction_details = {
+                        'group_price': group_price,
+                        'selling_fee': selling_fee,
+                        'seller_earnings': seller_earnings,
+                        'group_id': chat.id,
+                        'buyer_id': user.id
+                    }
+                    
+                    # Add transaction record for seller
+                    with db.lock:
+                        conn = db.get_connection()
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            INSERT INTO transactions (user_id, transaction_type, amount, group_ids, status)
+                            VALUES (?, 'sale', ?, ?, 'completed')
+                        ''', (seller_id, seller_earnings, json.dumps(transaction_details)))
+                        conn.commit()
+                        conn.close()
+                    
+                    # Notify seller
+                    try:
+                        seller_balance = db.get_user_balance(seller_id)
+                        await context.bot.send_message(
+                            chat_id=seller_id,
+                            text=f"💰 **Group Sold Successfully!**\n\n"
+                                 f"**Group:** {group_info.get('group_name', 'Unknown')}\n"
+                                 f"**Sale Price:** ${format_price(group_price)} USDT\n"
+                                 f"**Selling Fee ({SELLING_FEE_RATE * 100:.1f}%):** ${format_price(selling_fee)} USDT\n"
+                                 f"**Your Earnings:** ${format_price(seller_earnings)} USDT\n"
+                                 f"**New Balance:** ${format_balance(seller_balance)} USDT\n\n"
+                                 f"The group has been transferred to the buyer!",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to notify seller {seller_id}: {e}")
+                    
+                    logger.info(f"Seller {seller_id} paid ${seller_earnings} (after fee) for group {chat.id}")
+                else:
+                    logger.error(f"Failed to pay seller {seller_id} for group {chat.id}")
                 
                 # Mark group as sold to prevent re-listing
                 db.mark_group_as_sold(chat.id, user.id)
