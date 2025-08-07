@@ -115,6 +115,7 @@ class Database:
                     password_hash TEXT,
                     has_2fa BOOLEAN DEFAULT FALSE,
                     is_active BOOLEAN DEFAULT TRUE,
+                    session_type TEXT DEFAULT 'regular',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users (user_id),
                     UNIQUE(phone_number)
@@ -301,7 +302,7 @@ class Database:
                 return False
     
     def add_session(self, user_id: int, api_id: int, api_hash: str, phone_number: str, 
-                   session_string: str, password_hash: str = None, has_2fa: bool = False) -> bool:
+                   session_string: str, password_hash: str = None, has_2fa: bool = False, session_type: str = 'regular') -> bool:
         """Add new session to database with enhanced security checks"""
         with self.lock:
             try:
@@ -343,9 +344,9 @@ class Database:
                 
                 cursor.execute('''
                     INSERT INTO sessions (user_id, api_id, api_hash, phone_number, 
-                                        session_string, password_hash, has_2fa)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (user_id, api_id, api_hash, phone_number, session_string, password_hash, has_2fa))
+                                        session_string, password_hash, has_2fa, session_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (user_id, api_id, api_hash, phone_number, session_string, password_hash, has_2fa, session_type))
                 
                 conn.commit()
                 conn.close()
@@ -1345,7 +1346,7 @@ class SessionManager:
         """Verify password against hash"""
         return self.hash_password(password) == hashed
     
-    async def start_auth_process(self, user_id: int, api_id: int, api_hash: str, phone_number: str):
+    async def start_auth_process(self, user_id: int, api_id: int, api_hash: str, phone_number: str, session_type: str = 'regular'):
         """Start authentication process for new session"""
         try:
             session_file = os.path.join(SESSIONS_DIR, f"temp_{user_id}_{phone_number}")
@@ -1362,7 +1363,8 @@ class SessionManager:
                 'phone_number': phone_number,
                 'phone_code_hash': sent_code.phone_code_hash,
                 'session_file': session_file,
-                'step': 'code'
+                'step': 'code',
+                'session_type': session_type
             }
             
             return True
@@ -1454,6 +1456,8 @@ class SessionManager:
                 del self.pending_auth[user_id]
                 return False, "Sessions without 2FA are not allowed for security reasons"
             
+            session_type = auth_data.get('session_type', 'regular')
+            
             success = db.add_session(
                 user_id=user_id,
                 api_id=auth_data['api_id'],
@@ -1461,7 +1465,8 @@ class SessionManager:
                 phone_number=auth_data['phone_number'],
                 session_string=session_string,
                 password_hash=password_hash,
-                has_2fa=has_2fa
+                has_2fa=has_2fa,
+                session_type=session_type
             )
             
             if success:
@@ -1497,7 +1502,7 @@ class SessionManager:
             
             del self.pending_auth[user_id]
     
-    async def import_session_file(self, user_id: int, session_file: str, password: str = None) -> tuple:
+    async def import_session_file(self, user_id: int, session_file: str, password: str = None, api_id: int = None, api_hash: str = None) -> tuple:
         """Import .session file with enhanced 2FA validation"""
         try:
             # Load the session file
@@ -1572,9 +1577,11 @@ class SessionManager:
             session_string = session.save()
             password_hash = hashlib.sha256(password.encode()).hexdigest() if password else None
             
-            # Get API credentials from the session (try to extract from session data)
-            api_id = 0  # Default, may need to be provided separately
-            api_hash = ""  # Default, may need to be provided separately
+            # Use provided API credentials or defaults
+            if not api_id:
+                api_id = 0  # This will cause issues, but we handle it
+            if not api_hash:
+                api_hash = ""  # This will cause issues, but we handle it
             
             success = db.add_session(
                 user_id=user_id,
@@ -1672,6 +1679,16 @@ class SessionManager:
             
         except Exception as e:
             logger.error(f"Error getting group info for {group_id}: {e}")
+            return None
+    
+    async def get_group_invite_link(self, client: TelegramClient, group_id: int):
+        """Get group invite link"""
+        try:
+            entity = await client.get_entity(group_id)
+            result = await client(ExportChatInviteRequest(entity))
+            return result.link
+        except Exception as e:
+            logger.warning(f"Could not generate invite link for {group_id}: {e}")
             return None
     
     async def check_user_in_group(self, client: TelegramClient, group_id: int, user_id: int):
@@ -1990,6 +2007,52 @@ Ready to start trading? 🚀
 """
         
         await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
+    
+    async def add_bank_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /add_bank command for adding bank userbot sessions"""
+        user = update.effective_user
+        
+        if user.id not in BOT_OWNERS:
+            await update.message.reply_text(
+                "❌ Only bot administrators can add bank sessions.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Check existing bank sessions
+        existing_sessions = db.get_user_sessions(user.id)
+        bank_sessions = [s for s in existing_sessions if s.get('session_type') == 'bank']
+        
+        if len(bank_sessions) >= 1:  # Limit to 1 bank session for security
+            await update.message.reply_text(
+                "⚠️ **Bank Session Limit Reached**\n\n"
+                "Only one bank session is allowed for security reasons.\n"
+                "Use `/sessions` to manage existing bank sessions.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        await update.message.reply_text(
+            f"🏦 **Add Bank Userbot Session**\n\n"
+            f"This session will be used for payment processing via @cctip_bot.\n\n"
+            f"**⚠️ Important Security Notes:**\n"
+            f"• Bank sessions require 2FA enabled\n"
+            f"• Only one bank session per admin\n"
+            f"• Used exclusively for tip detection in bank group\n"
+            f"• Should be a dedicated account for security\n\n"
+            f"**Step 1:** Please enter your API ID\n"
+            f"Get it from: https://my.telegram.org",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        # Clear any existing session
+        if user.id in session_manager.pending_auth:
+            del session_manager.pending_auth[user.id]
+        
+        self.user_contexts[user.id] = {
+            'state': 'waiting_bank_api_id',
+            'session_type': 'bank'
+        }
     
     async def referral_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /referral command - show referral statistics and link"""
@@ -3374,29 +3437,24 @@ You can get this from https://my.telegram.org
         else:
             date_str = str(keyword_data['year'])
         
-        text = f"""
-📦 **Bulk Listing - {keyword.upper()}**
-
-**Target Date:** {date_str}
-**Group:** {chat.title}
-
-**Instructions:**
-1. Add our userbot to this group as admin
-2. Transfer group ownership to the userbot
-3. Type `/done` when ownership transfer is complete
-
-**⚠️ Important:**
-• You must transfer actual ownership (not just admin rights)
-• Only the original group owner should use `/done`
-• Group must meet listing requirements (private, 4+ messages, etc.)
-
-**Userbot to add:** @example_userbot
-"""
+        # Ask for price first
+        await update.message.reply_text(
+            f"📦 **Bulk Listing - {keyword.upper()}**\n\n"
+            f"**Target Date:** {date_str}\n"
+            f"**Group:** {chat.title}\n\n"
+            f"Please enter the price for this group in USDT:\n\n"
+            f"**Format:** Enter a positive number (max 2 decimal places)\n"
+            f"**Examples:** `10`, `25.50`, `99.99`",
+            parse_mode=ParseMode.MARKDOWN
+        )
         
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-        
-        # Add to pending bulk listings
-        self.add_pending_bulk_listing(user.id, chat.id, keyword_data)
+        # Set user context for price input
+        self.user_contexts[user.id] = {
+            'state': 'waiting_bulk_price',
+            'group_id': chat.id,
+            'keyword_data': keyword_data,
+            'group_title': chat.title
+        }
     
     def add_pending_bulk_listing(self, user_id: int, group_id: int, keyword_data: Dict):
         """Add pending bulk listing"""
@@ -3502,21 +3560,69 @@ You can get this from https://my.telegram.org
                     del self.pending_bulk_listings[chat.id]
                 return
             
-            # Create a fake price for the listing - in bulk mode, we need to ask for price
-            await update.message.reply_text(
-                "✅ **Group Ownership Verified!**\n\n"
-                "Now please enter the price for this group in USDT:",
-                parse_mode=ParseMode.MARKDOWN
-            )
+            # Get the price from bulk listing data
+            price = keyword_data.get('price')
+            creation_date = keyword_data.get('creation_date')
+            group_title = keyword_data.get('group_title', chat.title)
+            invite_link = group_info.get('invite_link') if group_info else None
             
-            # Set user context for price input in bulk mode
-            self.user_contexts[user.id] = {
-                'state': 'waiting_bulk_price',
-                'chat_id': chat.id,
-                'chat_title': chat.title,
-                'keyword_data': keyword_data,
-                'group_info': group_info
-            }
+            if not price:
+                await update.message.reply_text(
+                    "❌ **Price Missing**\n\n"
+                    "Bulk listing data is incomplete. Please start over with `/blist <keyword>`.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Generate buying ID
+            buying_id = db.get_or_create_buying_id(chat.id)
+            
+            # Add group to database
+            success = db.add_group(
+                 group_id=chat.id,
+                 group_name=group_title,
+                 group_username=chat.username or "",
+                 invite_link=invite_link or "",
+                 owner_user_id=user.id,
+                 session_id=session_data['id'],
+                 price=price,
+                 creation_date=creation_date,
+                 total_messages=group_info['total_messages']
+             )
+            
+            if success:
+                # Remove from pending bulk listings
+                if hasattr(self, 'pending_bulk_listings') and chat.id in self.pending_bulk_listings:
+                    del self.pending_bulk_listings[chat.id]
+                
+                # Format date for display
+                if keyword_data.get('month'):
+                    month_names = [
+                        "January", "February", "March", "April", "May", "June",
+                        "July", "August", "September", "October", "November", "December"
+                    ]
+                    date_str = f"{month_names[keyword_data['month']-1]} {keyword_data['year']}"
+                else:
+                    date_str = str(keyword_data['year'])
+                
+                await update.message.reply_text(
+                    f"🎉 **Bulk Listing Successful!**\n\n"
+                    f"**Group:** {group_title}\n"
+                    f"**Buying ID:** `{buying_id}`\n"
+                    f"**Price:** ${format_price(price)} USDT\n"
+                    f"**Target Date:** {date_str}\n"
+                    f"**Keyword:** {keyword_data['keyword']}\n\n"
+                    f"Your group is now available in the marketplace! 🚀",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+                logger.info(f"Bulk listing successful: Group {chat.id} by user {user.id} with keyword {keyword_data['keyword']}")
+            else:
+                await update.message.reply_text(
+                    "❌ **Listing Failed**\n\n"
+                    "Unable to add group to marketplace. Please try again or contact support.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
             
         except Exception as e:
             logger.error(f"Error in bulk done command: {e}")
@@ -3778,10 +3884,24 @@ You can get this from https://my.telegram.org
             await self.handle_code_input(update, context)
         elif state == 'waiting_password':
             await self.handle_password_input(update, context)
+        elif state == 'waiting_import_api_id':
+            await self.handle_import_api_id_input(update, context)
+        elif state == 'waiting_import_api_hash':
+            await self.handle_import_api_hash_input(update, context)
         elif state == 'waiting_import_password':
             await self.handle_import_password_input(update, context)
         elif state == 'waiting_bulk_price':
             await self.handle_bulk_price_input(update, context)
+        elif state == 'waiting_bank_api_id':
+            await self.handle_bank_api_id_input(update, context)
+        elif state == 'waiting_bank_api_hash':
+            await self.handle_bank_api_hash_input(update, context)
+        elif state == 'waiting_bank_phone':
+            await self.handle_bank_phone_input(update, context)
+        elif state == 'waiting_bank_code':
+            await self.handle_bank_code_input(update, context)
+        elif state == 'waiting_bank_password':
+            await self.handle_bank_password_input(update, context)
     
     async def handle_price_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle price input for listing"""
@@ -4147,9 +4267,22 @@ You will be notified when it's processed.
         password = None if password_input.lower() == 'skip' else password_input
         
         try:
-            # Import the session file
+            # Get API credentials from context
+            api_id = user_context.get('api_id')
+            api_hash = user_context.get('api_hash')
+            
+            if not api_id or not api_hash:
+                await update.message.reply_text(
+                    "❌ **Missing API Credentials**\n\n"
+                    "Please restart the import process.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                del self.user_contexts[user.id]
+                return
+            
+            # Import the session file with API credentials
             success, message = await session_manager.import_session_file(
-                user.id, session_file, password
+                user.id, session_file, password, api_id, api_hash
             )
             
             if success:
@@ -4179,6 +4312,59 @@ You will be notified when it's processed.
         
         del self.user_contexts[user.id]
     
+    async def handle_import_api_id_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle API ID input for session import"""
+        user = update.effective_user
+        api_id_str = update.message.text.strip()
+        
+        try:
+            api_id = int(api_id_str)
+            if api_id <= 0:
+                raise ValueError("API ID must be positive")
+        except ValueError:
+            await update.message.reply_text(
+                "❌ **Invalid API ID**\n\n"
+                "Please enter a valid API ID (numbers only):",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Update context and ask for API Hash
+        self.user_contexts[user.id]['api_id'] = api_id
+        self.user_contexts[user.id]['state'] = 'waiting_import_api_hash'
+        
+        await update.message.reply_text(
+            "✅ **API ID Saved**\n\n"
+            "**Step 2:** Enter your API Hash\n"
+            "(32-character string from https://my.telegram.org)",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def handle_import_api_hash_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle API Hash input for session import"""
+        user = update.effective_user
+        api_hash = update.message.text.strip()
+        
+        if len(api_hash) != 32 or not all(c in '0123456789abcdef' for c in api_hash.lower()):
+            await update.message.reply_text(
+                "❌ **Invalid API Hash**\n\n"
+                "Please enter a valid API Hash (32-character hexadecimal string):",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Update context and ask for password
+        self.user_contexts[user.id]['api_hash'] = api_hash
+        self.user_contexts[user.id]['state'] = 'waiting_import_password'
+        
+        await update.message.reply_text(
+            "✅ **API Hash Saved**\n\n"
+            "**Step 3:** Enter your 2FA password\n"
+            "If this session doesn't have 2FA enabled, type `skip`\n\n"
+            "⚠️ **Note:** Sessions without 2FA will be rejected for security.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
     async def handle_bulk_price_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle price input for bulk listing"""
         user = update.effective_user
@@ -4186,8 +4372,8 @@ You will be notified when it's processed.
         
         user_context = self.user_contexts[user.id]
         keyword_data = user_context['keyword_data']
-        group_info = user_context['group_info']
-        chat_id = user_context['chat_id']
+        group_id = user_context['group_id']
+        group_title = user_context['group_title']
         
         # Validate price
         is_valid, price = validate_price(price_text)
@@ -4201,7 +4387,7 @@ You will be notified when it's processed.
             return
         
         # Generate buying ID
-        buying_id = db.get_or_create_buying_id(chat_id)
+        buying_id = db.get_or_create_buying_id(group_id)
         
         # Set the creation date from keyword data
         if keyword_data['month']:
@@ -4222,42 +4408,226 @@ You will be notified when it's processed.
             date_str = str(keyword_data['year'])
         
         text = f"""
-✅ **Bulk Listing Ready for Confirmation**
+✅ **Bulk Listing - Price Set**
 
 **📋 Group Information:**
-**Group ID:** `{chat_id}`
+**Group ID:** `{group_id}`
 **Buying ID:** `{buying_id}`
-**Group Name:** {group_info['title']}
+**Group Name:** {group_title}
 **Target Date:** {date_str} (from keyword: {keyword_data['keyword']})
-**Total Messages:** {group_info['total_messages']}
 **Price:** ${format_price(price)} USDT
 
-**🔍 Validation Status:**
-✅ Private supergroup
-✅ Userbot has ownership
-✅ Minimum messages ({group_info['total_messages']} ≥ {MIN_GROUP_MESSAGES})
-✅ Bulk keyword applied
+**📝 Next Steps:**
+1. Add our userbot to this group as admin
+2. Transfer group ownership to the userbot
+3. Return to this group and type `/done` when complete
 
-Do you want to confirm this bulk listing?
+**⚠️ Important:**
+• You must transfer actual ownership (not just admin rights)
+• Only the original group owner should use `/done`
+• Group must meet listing requirements (private, 4+ messages, etc.)
+
+**Userbot to add:** @{context.bot.username}_bot
 """
         
-        keyboard = create_confirmation_keyboard("bulk_listing", f"{chat_id}_{price}_{keyword_data['keyword']}")
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        
+        # Add to pending bulk listings with price
+        self.add_pending_bulk_listing(user.id, group_id, {
+            **keyword_data,
+            'price': price,
+            'creation_date': creation_date,
+            'group_title': group_title
+        })
+        
+        # Clear user context
+        del self.user_contexts[user.id]
+    
+    # Bank Session Handlers
+    async def handle_bank_api_id_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle API ID input for bank session"""
+        user = update.effective_user
+        api_id_str = update.message.text.strip()
+        
+        is_valid, api_id = validate_api_credentials(api_id_str, "dummy")
+        
+        if not is_valid:
+            await update.message.reply_text(
+                "❌ Invalid API ID format.\n\n"
+                "Please enter a valid API ID (numbers only):",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        self.user_contexts[user.id]['api_id'] = api_id
+        self.user_contexts[user.id]['state'] = 'waiting_bank_api_hash'
         
         await update.message.reply_text(
-            text,
-            reply_markup=keyboard,
+            "✅ **API ID Saved**\n\n"
+            "**Step 2:** Please enter your API Hash\n"
+            "(32-character string from https://my.telegram.org):",
             parse_mode=ParseMode.MARKDOWN
         )
+    
+    async def handle_bank_api_hash_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle API Hash input for bank session"""
+        user = update.effective_user
+        api_hash = update.message.text.strip()
         
-        # Store for confirmation
-        self.user_contexts[user.id] = {
-            'state': 'waiting_bulk_confirmation',
-            'chat_id': chat_id,
-            'price': price,
-            'keyword_data': keyword_data,
-            'group_info': group_info,
-            'creation_date': creation_date
-        }
+        is_valid, _ = validate_api_credentials("12345", api_hash)
+        
+        if not is_valid:
+            await update.message.reply_text(
+                "❌ Invalid API Hash format.\n\n"
+                "Please enter a valid API Hash (32-character string):",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        self.user_contexts[user.id]['api_hash'] = api_hash
+        self.user_contexts[user.id]['state'] = 'waiting_bank_phone'
+        
+        await update.message.reply_text(
+            "✅ **API Hash Saved**\n\n"
+            "**Step 3:** Please enter your phone number\n"
+            "(Format: +1234567890):",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def handle_bank_phone_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle phone input for bank session"""
+        user = update.effective_user
+        phone = update.message.text.strip()
+        
+        if not validate_phone_number(phone):
+            await update.message.reply_text(
+                "❌ Invalid phone number format.\n\n"
+                "Please enter a valid phone number (e.g., +1234567890):",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        user_context = self.user_contexts[user.id]
+        api_id = user_context['api_id']
+        api_hash = user_context['api_hash']
+        
+        try:
+            success = await session_manager.start_auth_process(user.id, api_id, api_hash, phone, 'bank')
+            
+            if success:
+                self.user_contexts[user.id]['state'] = 'waiting_bank_code'
+                await update.message.reply_text(
+                    f"📱 **OTP Sent**\n\n"
+                    f"An OTP has been sent to {phone}.\n"
+                    f"Please enter the code:",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Failed to send OTP\n\n"
+                    f"Please try again with a valid phone number:",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        except Exception as e:
+            logger.error(f"Error starting bank auth: {e}")
+            await update.message.reply_text(
+                "❌ An error occurred. Please try again.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    async def handle_bank_code_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle OTP code input for bank session"""
+        user = update.effective_user
+        code = update.message.text.strip()
+        
+        if not code.isdigit() or len(code) != 5:
+            await update.message.reply_text(
+                "❌ Invalid code format.\n\n"
+                "Please enter the 5-digit code:",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        try:
+            success, message = await session_manager.verify_code(user.id, code)
+            
+            if success and "password required" in message.lower():
+                self.user_contexts[user.id]['state'] = 'waiting_bank_password'
+                await update.message.reply_text(
+                    f"🔐 **2FA Required**\n\n"
+                    f"Please enter your 2FA password:\n\n"
+                    f"⚠️ **Required for bank sessions**",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            elif success:
+                # This shouldn't happen for bank sessions (2FA required)
+                await update.message.reply_text(
+                    "❌ **2FA Required**\n\n"
+                    "Bank sessions must have 2FA enabled for security.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                del self.user_contexts[user.id]
+            else:
+                await update.message.reply_text(
+                    f"❌ {message}\n\n"
+                    f"Please try again:",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        except Exception as e:
+            logger.error(f"Error verifying bank code: {e}")
+            await update.message.reply_text(
+                "❌ An error occurred. Please try again.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    async def handle_bank_password_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle 2FA password input for bank session"""
+        user = update.effective_user
+        password = update.message.text.strip()
+        
+        try:
+            # First verify the password
+            success, message = await session_manager.verify_password(user.id, password)
+            
+            if success:
+                # Then complete authentication
+                success, complete_message = await session_manager.complete_auth(user.id)
+                
+                if success:
+                    await update.message.reply_text(
+                        "✅ **Bank Session Added Successfully!**\n\n"
+                        "🏦 Bank userbot is now active for payment processing.\n"
+                        "💡 This session will be used for tip detection in the bank group.\n\n"
+                        "**Security Features:**\n"
+                        "• Dedicated to payment processing only\n"
+                        "• Isolated from regular group operations\n"
+                        "• Enhanced monitoring and logging",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    logger.info(f"Bank session added successfully for user {user.id}")
+                else:
+                    await update.message.reply_text(
+                        f"❌ {complete_message}\n\n"
+                        f"Please try again:",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    return
+            else:
+                await update.message.reply_text(
+                    f"❌ {message}\n\n"
+                    f"Please try again:",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+                
+        except Exception as e:
+            logger.error(f"Error completing bank auth: {e}")
+            await update.message.reply_text(
+                "❌ An error occurred during authentication.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        
+        del self.user_contexts[user.id]
     
     # Payment Detection
     async def handle_tip_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4432,18 +4802,51 @@ Do you want to confirm this bulk listing?
             file_path = f"/tmp/{document.file_name}"
             await file.download_to_drive(file_path)
             
-            # Ask for 2FA password if needed
+            # Parse session file to check if it's valid
+            try:
+                from telethon.sessions import SQLiteSession
+                session = SQLiteSession(file_path)
+                
+                # Try to create a temporary client to validate the session
+                temp_client = TelegramClient(session, 0, "")
+                await temp_client.connect()
+                
+                if not await temp_client.is_user_authorized():
+                    await temp_client.disconnect()
+                    await update.message.reply_text(
+                        "❌ **Invalid Session File**\n\n"
+                        "The session file is not authorized or corrupted.",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    os.remove(file_path)
+                    return
+                
+                await temp_client.disconnect()
+                
+            except Exception as e:
+                logger.error(f"Error validating session file: {e}")
+                await update.message.reply_text(
+                    "❌ **Invalid Session File**\n\n"
+                    "Unable to parse the session file. Please ensure it's a valid Telethon .session file.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                os.remove(file_path)
+                return
+            
+            # Ask for API credentials first
             text = """
-📁 **Session File Downloaded**
+📁 **Session File Validated**
 
-If this session has 2-step verification enabled, please enter the password.
-If not, type `skip`:
+To import this session, please provide your API credentials:
+
+**Step 1:** Enter your API ID
+(Get it from https://my.telegram.org)
 """
             
             await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
             
             self.user_contexts[update.effective_user.id] = {
-                'state': 'waiting_import_password',
+                'state': 'waiting_import_api_id',
                 'session_file': file_path
             }
             
@@ -4752,7 +5155,7 @@ class TelegramMarketBot:
         # Admin Commands
         app.add_handler(CommandHandler("ahelp", bot_commands.admin_help_command))
         app.add_handler(CommandHandler("add", bot_commands.add_session_command))
-        app.add_handler(CommandHandler("add_bank", bot_commands.add_session_command))
+        app.add_handler(CommandHandler("add_bank", bot_commands.add_bank_command))
         app.add_handler(CommandHandler("users", bot_commands.users_command))
         app.add_handler(CommandHandler("add_bal", bot_commands.add_balance_command))
         app.add_handler(CommandHandler("import", bot_commands.import_command))
