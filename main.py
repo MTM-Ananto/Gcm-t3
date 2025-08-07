@@ -55,6 +55,8 @@ class TelegramMarketBot:
         app.add_handler(CommandHandler("refund", bot_commands.refund_command))
         app.add_handler(CommandHandler("cprice", bot_commands.cprice_command))
         app.add_handler(CommandHandler("withdraw", bot_commands.withdraw_command))
+        app.add_handler(CommandHandler("set_bulk", bot_commands.set_bulk_command))
+        app.add_handler(CommandHandler("blist", bot_commands.blist_command))
         
         # Admin Commands
         app.add_handler(CommandHandler("ahelp", bot_commands.admin_help_command))

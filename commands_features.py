@@ -916,6 +916,240 @@ If not, type `skip`:
             'state': 'waiting_import_password',
             'session_file': file_path
         }
+    
+    # Bulk Listing Commands
+    async def set_bulk_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /set_bulk command to create keyword shortcuts"""
+        user = update.effective_user
+        
+        if not context.args or len(context.args) < 2:
+            # Show existing keywords
+            keywords = db.get_user_bulk_keywords(user.id)
+            
+            if not keywords:
+                await update.message.reply_text(
+                    "📝 **Bulk Listing Keywords**\n\n"
+                    "No keywords set yet.\n\n"
+                    "**Usage:** `/set_bulk <keyword> <year>` or `/set_bulk <keyword> <year+month>`\n\n"
+                    "**Examples:**\n"
+                    "• `/set_bulk old2020 2020` - Set keyword 'old2020' for year 2020\n"
+                    "• `/set_bulk jan2025 2025+1` - Set keyword 'jan2025' for January 2025\n"
+                    "• `/set_bulk summer 2024+7` - Set keyword 'summer' for July 2024",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            text = "📝 **Your Bulk Listing Keywords**\n\n"
+            for keyword in keywords:
+                if keyword['month']:
+                    month_names = [
+                        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+                    ]
+                    date_str = f"{month_names[keyword['month']-1]} {keyword['year']}"
+                else:
+                    date_str = str(keyword['year'])
+                
+                text += f"• **{keyword['keyword']}** → {date_str}\n"
+            
+            text += "\n**Usage:** `/set_bulk <keyword> <year>` or `/set_bulk <keyword> <year+month>`"
+            
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            return
+        
+        keyword = context.args[0].lower()
+        date_input = context.args[1]
+        
+        # Validate keyword
+        if not keyword.isalnum():
+            await update.message.reply_text(
+                "❌ **Invalid Keyword**\n\n"
+                "Keywords must contain only letters and numbers.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        if len(keyword) > 20:
+            await update.message.reply_text(
+                "❌ **Keyword Too Long**\n\n"
+                "Keywords must be 20 characters or less.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Parse date input
+        try:
+            if '+' in date_input:
+                # Year+Month format
+                year_str, month_str = date_input.split('+')
+                year = int(year_str)
+                month = int(month_str)
+                
+                if month < 1 or month > 12:
+                    raise ValueError("Invalid month")
+            else:
+                # Year only format
+                year = int(date_input)
+                month = None
+            
+            # Validate year
+            if year < 2016 or year > 2030:
+                await update.message.reply_text(
+                    "❌ **Invalid Year**\n\n"
+                    "Year must be between 2016 and 2030.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+                
+        except ValueError:
+            await update.message.reply_text(
+                "❌ **Invalid Date Format**\n\n"
+                "**Examples:**\n"
+                "• `2025` - For year 2025\n"
+                "• `2025+1` - For January 2025\n"
+                "• `2024+12` - For December 2024",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Save keyword
+        success = db.add_bulk_keyword(user.id, keyword, year, month)
+        
+        if success:
+            if month:
+                month_names = [
+                    "January", "February", "March", "April", "May", "June",
+                    "July", "August", "September", "October", "November", "December"
+                ]
+                date_str = f"{month_names[month-1]} {year}"
+            else:
+                date_str = str(year)
+            
+            await update.message.reply_text(
+                f"✅ **Keyword Set Successfully!**\n\n"
+                f"**Keyword:** `{keyword}`\n"
+                f"**Target Date:** {date_str}\n\n"
+                f"Now you can use `/blist {keyword}` for quick bulk listing!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Failed to save keyword. Please try again.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    async def blist_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /blist command for bulk listing"""
+        user = update.effective_user
+        chat = update.effective_chat
+        
+        if chat.type not in ['group', 'supergroup']:
+            await update.message.reply_text(
+                "❌ This command can only be used in groups.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "❌ **Missing Keyword**\n\n"
+                "**Usage:** `/blist <keyword>`\n\n"
+                "Use `/set_bulk` to create keywords first.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        keyword = context.args[0].lower()
+        
+        # Get keyword details
+        keyword_data = db.get_bulk_keyword(user.id, keyword)
+        if not keyword_data:
+            await update.message.reply_text(
+                f"❌ **Keyword Not Found**\n\n"
+                f"The keyword `{keyword}` doesn't exist.\n\n"
+                f"Use `/set_bulk {keyword} <year>` to create it first.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Check if user is the group owner/admin
+        try:
+            chat_member = await context.bot.get_chat_member(chat.id, user.id)
+            if chat_member.status not in ['creator', 'administrator']:
+                await update.message.reply_text(
+                    "❌ **Permission Denied**\n\n"
+                    "Only group owners and administrators can list groups.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+        except Exception as e:
+            await update.message.reply_text(
+                "❌ Unable to verify your permissions in this group.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        if keyword_data['month']:
+            month_names = [
+                "January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December"
+            ]
+            date_str = f"{month_names[keyword_data['month']-1]} {keyword_data['year']}"
+        else:
+            date_str = str(keyword_data['year'])
+        
+        text = f"""
+📦 **Bulk Listing - {keyword.upper()}**
+
+**Target Date:** {date_str}
+**Group:** {chat.title}
+
+**Instructions:**
+1. Add our userbot to this group as admin
+2. Transfer group ownership to the userbot
+3. Type `/done` when ownership transfer is complete
+
+**⚠️ Important:**
+• You must transfer actual ownership (not just admin rights)
+• Only the original group owner should use `/done`
+• Group must meet listing requirements (private, 4+ messages, etc.)
+
+**Userbot to add:** @example_userbot
+"""
+        
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        
+        # Add to pending bulk listings
+        self.add_pending_bulk_listing(user.id, chat.id, keyword_data)
+    
+    def add_pending_bulk_listing(self, user_id: int, group_id: int, keyword_data: Dict):
+        """Add pending bulk listing"""
+        from datetime import datetime, timedelta
+        
+        # Store in user context for /done validation
+        if not hasattr(self, 'pending_bulk_listings'):
+            self.pending_bulk_listings = {}
+        
+        self.pending_bulk_listings[group_id] = {
+            'user_id': user_id,
+            'keyword_data': keyword_data,
+            'timestamp': datetime.now(),
+            'expires_at': datetime.now() + timedelta(minutes=10)
+        }
+    
+    def get_pending_bulk_listing(self, group_id: int) -> Optional[Dict]:
+        """Get pending bulk listing"""
+        if not hasattr(self, 'pending_bulk_listings'):
+            return None
+        
+        listing = self.pending_bulk_listings.get(group_id)
+        if listing and listing['expires_at'] > datetime.now():
+            return listing
+        elif listing:
+            # Remove expired listing
+            del self.pending_bulk_listings[group_id]
+        
+        return None
 
 # Global instance
 bot_commands = BotCommands()

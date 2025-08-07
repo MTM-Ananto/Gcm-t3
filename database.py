@@ -1,11 +1,14 @@
 import sqlite3
 import json
 import hashlib
+import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 import asyncio
 import threading
 from config import DATABASE_URL
+
+logger = logging.getLogger(__name__)
 
 class Database:
     def __init__(self):
@@ -118,6 +121,20 @@ class Database:
                     userbot_username TEXT,
                     expires_at TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # Bulk keywords table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS bulk_keywords (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    keyword TEXT NOT NULL,
+                    year INTEGER NOT NULL,
+                    month INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, keyword),
                     FOREIGN KEY (user_id) REFERENCES users (user_id)
                 )
             ''')
@@ -495,6 +512,87 @@ class Database:
             result = cursor.fetchone()[0]
             conn.close()
             return result or 0.0
+    
+    def add_bulk_keyword(self, user_id: int, keyword: str, year: int, month: int = None) -> bool:
+        """Add or update a bulk keyword for user"""
+        with self.lock:
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT OR REPLACE INTO bulk_keywords (user_id, keyword, year, month)
+                    VALUES (?, ?, ?, ?)
+                ''', (user_id, keyword.lower(), year, month))
+                conn.commit()
+                conn.close()
+                return True
+            except Exception as e:
+                logger.error(f"Error adding bulk keyword: {e}")
+                return False
+    
+    def get_bulk_keyword(self, user_id: int, keyword: str) -> Optional[Dict]:
+        """Get bulk keyword details"""
+        with self.lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT keyword, year, month, created_at 
+                FROM bulk_keywords 
+                WHERE user_id = ? AND keyword = ?
+            ''', (user_id, keyword.lower()))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                return {
+                    'keyword': result[0],
+                    'year': result[1],
+                    'month': result[2],
+                    'created_at': result[3]
+                }
+            return None
+    
+    def get_user_bulk_keywords(self, user_id: int) -> List[Dict]:
+        """Get all bulk keywords for user"""
+        with self.lock:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT keyword, year, month, created_at 
+                FROM bulk_keywords 
+                WHERE user_id = ? 
+                ORDER BY created_at DESC
+            ''', (user_id,))
+            
+            keywords = []
+            for row in cursor.fetchall():
+                keywords.append({
+                    'keyword': row[0],
+                    'year': row[1],
+                    'month': row[2],
+                    'created_at': row[3]
+                })
+            
+            conn.close()
+            return keywords
+    
+    def delete_bulk_keyword(self, user_id: int, keyword: str) -> bool:
+        """Delete a bulk keyword"""
+        with self.lock:
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    DELETE FROM bulk_keywords 
+                    WHERE user_id = ? AND keyword = ?
+                ''', (user_id, keyword.lower()))
+                conn.commit()
+                conn.close()
+                return True
+            except Exception as e:
+                logger.error(f"Error deleting bulk keyword: {e}")
+                return False
 
 # Global database instance
 db = Database()
