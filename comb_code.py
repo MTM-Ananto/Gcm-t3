@@ -901,7 +901,7 @@ class SessionManager:
         """Hash password using SHA-256"""
         return hashlib.sha256(password.encode()).hexdigest()
     
-    def verify_password(self, password: str, hashed: str) -> bool:
+    def verify_password_hash(self, password: str, hashed: str) -> bool:
         """Verify password against hash"""
         return self.hash_password(password) == hashed
     
@@ -1672,6 +1672,24 @@ Do you want to confirm this listing?
         if user.id not in BOT_OWNERS:
             return
         
+        # Check session limit
+        existing_sessions = db.get_user_sessions(user.id)
+        if len(existing_sessions) >= MAX_SESSIONS_PER_USER:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 Manage Sessions", callback_data="manage_sessions")],
+                [InlineKeyboardButton("🔄 Overwrite Session", callback_data="overwrite_session")]
+            ])
+            
+            await update.message.reply_text(
+                f"⚠️ **Session Limit Reached**\n\n"
+                f"You have reached the maximum limit of {MAX_SESSIONS_PER_USER} sessions.\n\n"
+                f"**Current sessions:** {len(existing_sessions)}/{MAX_SESSIONS_PER_USER}\n\n"
+                f"Please manage your existing sessions or choose to overwrite:",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
         text = """
 🤖 **Add Userbot Session**
 
@@ -1960,6 +1978,60 @@ You can get this from https://my.telegram.org
         
         os.remove(filepath)
     
+    async def sessions_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /sessions command to manage user sessions"""
+        user = update.effective_user
+        
+        if user.id not in BOT_OWNERS:
+            return
+        
+        sessions = db.get_user_sessions(user.id)
+        
+        if not sessions:
+            await update.message.reply_text(
+                "📱 **No Sessions Found**\n\n"
+                "You don't have any userbot sessions.\n\n"
+                "Use `/add` to add a new session.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        text = f"📱 **Your Userbot Sessions**\n\n"
+        text += f"**Total:** {len(sessions)}/{MAX_SESSIONS_PER_USER}\n\n"
+        
+        keyboard_buttons = []
+        
+        for i, session in enumerate(sessions, 1):
+            status = "🟢 Active" if session['is_active'] else "🔴 Inactive"
+            has_2fa = "🔒 2FA" if session['has_2fa'] else "🔓 No 2FA"
+            
+            text += f"**{i}.** Session {session['id']}\n"
+            text += f"   • **Phone:** {session['phone_number']}\n"
+            text += f"   • **Status:** {status}\n"
+            text += f"   • **Security:** {has_2fa}\n"
+            text += f"   • **Added:** {session['created_at'][:10]}\n\n"
+            
+            # Add buttons for each session
+            row = [
+                InlineKeyboardButton(f"🔧 Manage #{i}", callback_data=f"manage_session_{session['id']}"),
+                InlineKeyboardButton(f"🗑️ Remove #{i}", callback_data=f"remove_session_{session['id']}")
+            ]
+            keyboard_buttons.append(row)
+        
+        # Add action buttons
+        keyboard_buttons.append([
+            InlineKeyboardButton("➕ Add New Session", callback_data="add_new_session"),
+            InlineKeyboardButton("🔄 Refresh", callback_data="refresh_sessions")
+        ])
+        
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
+        
+        await update.message.reply_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
     # Callback Query Handlers
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline keyboard callbacks"""
@@ -1974,6 +2046,22 @@ You can get this from https://my.telegram.org
             await self.handle_month_selection(query, context)
         elif data == 'market_back':
             await self.market_command(update, context)
+        elif data.startswith("manage_session_"):
+            await self.handle_session_management(query, context)
+        elif data.startswith("remove_session_"):
+            await self.handle_session_removal(query, context)
+        elif data == "manage_sessions":
+            await self.handle_sessions_command_callback(query, context)
+        elif data == "overwrite_session":
+            await self.handle_session_overwrite(query, context)
+        elif data == "add_new_session":
+            await self.handle_add_new_session_callback(query, context)
+        elif data == "refresh_sessions":
+            await self.handle_refresh_sessions(query, context)
+        elif data == "restart_session_setup":
+            await self.handle_restart_session_setup(query, context)
+        elif data == "cancel_session_setup":
+            await self.handle_cancel_session_setup(query, context)
     
     async def handle_year_selection(self, query, context):
         """Handle year selection in market"""
@@ -2030,6 +2118,142 @@ Select a price range to view groups:
 """
         
         await query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    
+    # Session Management Callbacks
+    async def handle_session_management(self, query, context):
+        """Handle session management callback"""
+        session_id = int(query.data.split('_')[2])
+        
+        # Get session details
+        session_info = self.get_session_details(query.from_user.id, session_id)
+        if not session_info:
+            await query.edit_message_text("❌ Session not found.")
+            return
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Test Connection", callback_data=f"test_session_{session_id}")],
+            [InlineKeyboardButton("🔒 Change 2FA", callback_data=f"change_2fa_{session_id}")],
+            [InlineKeyboardButton("📱 Toggle Active", callback_data=f"toggle_session_{session_id}")],
+            [InlineKeyboardButton("🗑️ Delete Session", callback_data=f"delete_session_{session_id}")],
+            [InlineKeyboardButton("⬅️ Back to Sessions", callback_data="refresh_sessions")]
+        ])
+        
+        status = "🟢 Active" if session_info['is_active'] else "🔴 Inactive"
+        has_2fa = "🔒 2FA Enabled" if session_info['has_2fa'] else "🔓 No 2FA"
+        
+        text = f"""
+📱 **Session Management**
+
+**Session ID:** {session_id}
+**Phone:** {session_info['phone_number']}
+**Status:** {status}
+**Security:** {has_2fa}
+**Created:** {session_info['created_at'][:10]}
+
+Choose an action:
+"""
+        
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    
+    async def handle_session_removal(self, query, context):
+        """Handle session removal callback"""
+        session_id = int(query.data.split('_')[2])
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_{session_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="refresh_sessions")]
+        ])
+        
+        await query.edit_message_text(
+            f"🗑️ **Confirm Session Deletion**\n\n"
+            f"Are you sure you want to delete session {session_id}?\n\n"
+            f"**This action cannot be undone!**",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def handle_sessions_command_callback(self, query, context):
+        """Handle manage sessions callback"""
+        # Redirect to sessions command
+        await self.sessions_command(query, context)
+    
+    async def handle_session_overwrite(self, query, context):
+        """Handle session overwrite callback"""
+        user_id = query.from_user.id
+        
+        # Show list of sessions to overwrite
+        sessions = db.get_user_sessions(user_id)
+        keyboard_buttons = []
+        
+        for session in sessions:
+            status = "🟢" if session['is_active'] else "🔴"
+            keyboard_buttons.append([
+                InlineKeyboardButton(
+                    f"{status} {session['phone_number']} (ID: {session['id']})",
+                    callback_data=f"overwrite_session_id_{session['id']}"
+                )
+            ])
+        
+        keyboard_buttons.append([
+            InlineKeyboardButton("❌ Cancel", callback_data="refresh_sessions")
+        ])
+        
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
+        
+        await query.edit_message_text(
+            "🔄 **Select Session to Overwrite**\n\n"
+            "Choose which session you want to replace:",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def handle_add_new_session_callback(self, query, context):
+        """Handle add new session callback"""
+        # Start the session adding process
+        text = """
+🤖 **Add Userbot Session**
+
+Let's add a new userbot session for group transfers.
+
+Please provide your **API ID**:
+
+You can get this from https://my.telegram.org
+"""
+        
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+        self.user_contexts[query.from_user.id] = {'state': 'waiting_api_id'}
+    
+    async def handle_refresh_sessions(self, query, context):
+        """Handle refresh sessions callback"""
+        await self.sessions_command(query, context)
+    
+    async def handle_restart_session_setup(self, query, context):
+        """Handle restart session setup callback"""
+        user_id = query.from_user.id
+        if user_id in self.user_contexts:
+            del self.user_contexts[user_id]
+        
+        await self.handle_add_new_session_callback(query, context)
+    
+    async def handle_cancel_session_setup(self, query, context):
+        """Handle cancel session setup callback"""
+        user_id = query.from_user.id
+        if user_id in self.user_contexts:
+            del self.user_contexts[user_id]
+        
+        await query.edit_message_text(
+            "❌ **Session Setup Cancelled**\n\n"
+            "Session setup has been cancelled.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    def get_session_details(self, user_id: int, session_id: int) -> Optional[Dict]:
+        """Get detailed session information"""
+        sessions = db.get_user_sessions(user_id)
+        for session in sessions:
+            if session['id'] == session_id:
+                return session
+        return None
     
     # Message Handlers
     async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2309,9 +2533,12 @@ You will be notified when it's processed.
             )
     
     async def handle_password_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle 2FA password input"""
+        """Handle 2FA password input with retry logic"""
         user = update.effective_user
         password = update.message.text.strip()
+        
+        user_context = self.user_contexts.get(user.id, {})
+        retry_count = user_context.get('password_retries', 0)
         
         success, message = await session_manager.verify_password(user.id, password)
         
@@ -2319,23 +2546,98 @@ You will be notified when it's processed.
             success, complete_message = await session_manager.complete_auth(user.id)
             
             if success:
-                await update.message.reply_text(
-                    "✅ **Session Added Successfully!**\n\n"
-                    "Your userbot session has been saved with 2FA protection.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
+                # Validate session after successful login
+                validation_success = await self.validate_session_post_login(user.id)
+                if validation_success:
+                    await update.message.reply_text(
+                        "✅ **Session Added Successfully!**\n\n"
+                        "Your userbot session has been saved with 2FA protection and validated.",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                else:
+                    await update.message.reply_text(
+                        "⚠️ **Session Saved with Warning**\n\n"
+                        "Session was saved but validation failed. Please check session manually.",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
             else:
                 await update.message.reply_text(
                     f"❌ Failed to save session: {complete_message}",
                     parse_mode=ParseMode.MARKDOWN
                 )
+            del self.user_contexts[user.id]
         else:
-            await update.message.reply_text(
-                f"❌ {message}\n\nPlease try again:",
-                parse_mode=ParseMode.MARKDOWN
+            retry_count += 1
+            
+            if retry_count >= 3:
+                await update.message.reply_text(
+                    "❌ **Too Many Failed Attempts**\n\n"
+                    "Maximum password attempts exceeded. Please restart the session adding process.\n\n"
+                    "**Hints:**\n"
+                    "• Make sure you're using your 2-Step Verification password\n"
+                    "• Check for typos or extra spaces\n"
+                    "• Ensure your account has 2FA enabled\n"
+                    "• Try using `/add` again if needed",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                del self.user_contexts[user.id]
+            else:
+                remaining_attempts = 3 - retry_count
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Restart Session Setup", callback_data="restart_session_setup")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="cancel_session_setup")]
+                ])
+                
+                await update.message.reply_text(
+                    f"❌ **Incorrect Password**\n\n"
+                    f"{message}\n\n"
+                    f"**Attempts remaining:** {remaining_attempts}/3\n\n"
+                    f"**Tips:**\n"
+                    f"• Use your 2-Step Verification password (not login password)\n"
+                    f"• Check for typos and extra spaces\n"
+                    f"• Make sure 2FA is enabled on your account\n\n"
+                    f"Please enter your 2FA password again:",
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+                self.user_contexts[user.id] = {
+                    **user_context,
+                    'password_retries': retry_count
+                }
+    
+    async def validate_session_post_login(self, user_id: int) -> bool:
+        """Validate session after successful login"""
+        try:
+            sessions = db.get_user_sessions(user_id)
+            if not sessions:
+                return False
+            
+            # Get the most recent session
+            latest_session = sessions[-1]
+            
+            # Create a temporary client to test the session
+            client = TelegramClient(
+                session=latest_session['session_string'],
+                api_id=latest_session['api_id'],
+                api_hash=latest_session['api_hash']
             )
-        
-        del self.user_contexts[user.id]
+            
+            await client.connect()
+            
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                logger.info(f"Session validated for user {me.id} (@{me.username})")
+                await client.disconnect()
+                return True
+            else:
+                logger.warning(f"Session validation failed - not authorized")
+                await client.disconnect()
+                return False
+                
+        except Exception as e:
+            logger.error(f"Session validation error: {e}")
+            return False
     
     async def handle_import_password_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle password input for session import"""
@@ -2570,6 +2872,7 @@ class TelegramMarketBot:
         app.add_handler(CommandHandler("add_bal", bot_commands.add_balance_command))
         app.add_handler(CommandHandler("import", bot_commands.import_command))
         app.add_handler(CommandHandler("export", bot_commands.export_command))
+        app.add_handler(CommandHandler("sessions", bot_commands.sessions_command))
         
         # Callback Query Handler
         app.add_handler(CallbackQueryHandler(bot_commands.handle_callback_query))
