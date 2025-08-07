@@ -55,7 +55,7 @@ from config import (
     BOT_TOKEN, BOT_OWNERS, CCTIP_BOT_USERNAME, CCTIP_BOT_ID, BANK_GROUP_ID,
     DATABASE_URL, SESSIONS_DIR, MAX_SESSIONS_PER_USER, MIN_GROUP_MESSAGES,
     MIN_PRICE, MAX_PRICE, LISTING_TIMEOUT, GROUPS_PER_PAGE, USERS_PER_PAGE,
-    MIN_WITHDRAWAL, BUYING_FEE_RATE, SELLING_FEE_RATE
+    MIN_WITHDRAWAL, BUYING_FEE_RATE, SELLING_FEE_RATE, REFERRAL_COMMISSION_RATE
 )
 
 # ============================================================================
@@ -203,6 +203,37 @@ class Database:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(user_id, keyword),
                     FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # Referral relationships table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS referrals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    referrer_id INTEGER NOT NULL,
+                    referred_id INTEGER NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(referred_id),
+                    FOREIGN KEY (referrer_id) REFERENCES users (user_id),
+                    FOREIGN KEY (referred_id) REFERENCES users (user_id),
+                    CHECK (referrer_id != referred_id)
+                )
+            ''')
+            
+            # Referral earnings table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS referral_earnings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    referrer_id INTEGER NOT NULL,
+                    referred_id INTEGER NOT NULL,
+                    transaction_id INTEGER,
+                    transaction_type TEXT NOT NULL,
+                    fee_amount REAL NOT NULL,
+                    commission_amount REAL NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (referrer_id) REFERENCES users (user_id),
+                    FOREIGN KEY (referred_id) REFERENCES users (user_id),
+                    FOREIGN KEY (transaction_id) REFERENCES transactions (id)
                 )
             ''')
             
@@ -577,8 +608,22 @@ class Database:
                     VALUES (?, 'purchase', ?, ?, 'completed')
                 ''', (user_id, -total_cost, json.dumps(transaction_details)))
                 
+                # Get transaction ID for referral tracking
+                transaction_id = cursor.lastrowid
+                
                 conn.commit()
                 conn.close()
+                
+                # Handle referral commission for buying fees
+                referrer_id = self.get_referrer(user_id)
+                if referrer_id and final_fee > 0:
+                    commission = final_fee * REFERRAL_COMMISSION_RATE
+                    success = self.add_referral_earning(
+                        referrer_id, user_id, 'buying_fee', final_fee, commission, transaction_id
+                    )
+                    if success:
+                        logger.info(f"Referral commission paid: ${commission:.4f} to {referrer_id} for buying fee from {user_id}")
+                
                 return True
             except Exception as e:
                 logger.error(f"Error purchasing groups: {e}")
@@ -737,6 +782,152 @@ class Database:
                 return True
             except Exception as e:
                 logger.error(f"Error deleting bulk keyword: {e}")
+                return False
+    
+    # Referral System Methods
+    def add_referral(self, referrer_id: int, referred_id: int) -> bool:
+        """Add a referral relationship with protection against abuse"""
+        with self.lock:
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                
+                # Check if referred user already has a referrer
+                cursor.execute('SELECT referrer_id FROM referrals WHERE referred_id = ?', (referred_id,))
+                existing = cursor.fetchone()
+                if existing:
+                    conn.close()
+                    return False  # User already referred by someone else
+                
+                # Check if trying to refer themselves
+                if referrer_id == referred_id:
+                    conn.close()
+                    return False
+                
+                # Check if both users exist
+                cursor.execute('SELECT user_id FROM users WHERE user_id IN (?, ?)', (referrer_id, referred_id))
+                users = cursor.fetchall()
+                if len(users) != 2:
+                    conn.close()
+                    return False
+                
+                # Add referral relationship
+                cursor.execute('''
+                    INSERT INTO referrals (referrer_id, referred_id)
+                    VALUES (?, ?)
+                ''', (referrer_id, referred_id))
+                
+                conn.commit()
+                conn.close()
+                logger.info(f"Referral added: {referrer_id} referred {referred_id}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error adding referral: {e}")
+                return False
+    
+    def get_referrer(self, user_id: int) -> Optional[int]:
+        """Get the referrer of a user"""
+        with self.lock:
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                cursor.execute('SELECT referrer_id FROM referrals WHERE referred_id = ?', (user_id,))
+                result = cursor.fetchone()
+                conn.close()
+                return result[0] if result else None
+            except Exception as e:
+                logger.error(f"Error getting referrer: {e}")
+                return None
+    
+    def get_referral_stats(self, user_id: int) -> dict:
+        """Get comprehensive referral statistics for a user"""
+        with self.lock:
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                
+                # Get total referrals count
+                cursor.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id = ?', (user_id,))
+                total_referrals = cursor.fetchone()[0]
+                
+                # Get total referral earnings
+                cursor.execute('SELECT SUM(commission_amount) FROM referral_earnings WHERE referrer_id = ?', (user_id,))
+                total_earnings = cursor.fetchone()[0] or 0.0
+                
+                # Get recent referrals (last 10)
+                cursor.execute('''
+                    SELECT r.referred_id, u.username, u.first_name, r.created_at
+                    FROM referrals r
+                    JOIN users u ON r.referred_id = u.user_id
+                    WHERE r.referrer_id = ?
+                    ORDER BY r.created_at DESC
+                    LIMIT 10
+                ''', (user_id,))
+                recent_referrals = cursor.fetchall()
+                
+                # Get monthly earnings breakdown
+                cursor.execute('''
+                    SELECT DATE(created_at) as date, SUM(commission_amount) as daily_earnings
+                    FROM referral_earnings
+                    WHERE referrer_id = ? AND created_at >= DATE('now', '-30 days')
+                    GROUP BY DATE(created_at)
+                    ORDER BY date DESC
+                ''', (user_id,))
+                monthly_breakdown = cursor.fetchall()
+                
+                conn.close()
+                
+                return {
+                    'total_referrals': total_referrals,
+                    'total_earnings': total_earnings,
+                    'recent_referrals': recent_referrals,
+                    'monthly_breakdown': monthly_breakdown
+                }
+                
+            except Exception as e:
+                logger.error(f"Error getting referral stats: {e}")
+                return {
+                    'total_referrals': 0,
+                    'total_earnings': 0.0,
+                    'recent_referrals': [],
+                    'monthly_breakdown': []
+                }
+    
+    def add_referral_earning(self, referrer_id: int, referred_id: int, transaction_type: str, 
+                           fee_amount: float, commission_amount: float, transaction_id: int = None) -> bool:
+        """Record a referral earning"""
+        with self.lock:
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                
+                # Add referral earning record
+                cursor.execute('''
+                    INSERT INTO referral_earnings 
+                    (referrer_id, referred_id, transaction_id, transaction_type, fee_amount, commission_amount)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (referrer_id, referred_id, transaction_id, transaction_type, fee_amount, commission_amount))
+                
+                # Add commission to referrer's balance
+                cursor.execute('''
+                    UPDATE users SET balance = balance + ?
+                    WHERE user_id = ?
+                ''', (commission_amount, referrer_id))
+                
+                # Record transaction for referrer
+                cursor.execute('''
+                    INSERT INTO transactions (user_id, transaction_type, amount, status)
+                    VALUES (?, 'referral_commission', ?, 'completed')
+                ''', (referrer_id, commission_amount))
+                
+                conn.commit()
+                conn.close()
+                logger.info(f"Referral earning added: {referrer_id} earned ${commission_amount:.4f} from {referred_id}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error adding referral earning: {e}")
                 return False
 
 # ============================================================================
@@ -1061,6 +1252,10 @@ def generate_help_text() -> str:
 • `/refund` - Get refund for listed group (use in the group)
 • `/cprice <price>` - Change group price (use in the group)
   Examples: `/cprice 25.50`, `/cprice 100.00`
+
+🎯 **Referral System:**
+• `/referral` - Get your referral link and view earnings
+• **Earn {REFERRAL_COMMISSION_RATE * 100:.0f}% commission** from referral fees!
 
 ❓ **Help:**
 • `/help` - Show this help message
@@ -1721,15 +1916,58 @@ class BotCommands:
             conn.close()
         
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
+        """Handle /start command with referral support"""
         user = update.effective_user
         
+        # Add user to database
         db.add_user(user.id, user.username, user.first_name)
+        
+        referral_message = ""
+        
+        # Handle referral links
+        if context.args and len(context.args) > 0:
+            try:
+                referrer_id = int(context.args[0])
+                
+                # Check if user already has a referrer
+                existing_referrer = db.get_referrer(user.id)
+                if existing_referrer is None and referrer_id != user.id:
+                    success = db.add_referral(referrer_id, user.id)
+                    if success:
+                        # Get referrer info
+                        conn = db.get_connection()
+                        cursor = conn.cursor()
+                        cursor.execute('SELECT username, first_name FROM users WHERE user_id = ?', (referrer_id,))
+                        referrer_info = cursor.fetchone()
+                        conn.close()
+                        
+                        if referrer_info:
+                            referrer_name = referrer_info[0] or referrer_info[1] or f"User {referrer_id}"
+                            referral_message = f"\n🎉 **Referral Success!**\nYou've been referred by {referrer_name}. You'll both earn from each other's fees!\n"
+                            
+                            # Notify referrer
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=referrer_id,
+                                    text=f"🎊 **New Referral!**\n\n"
+                                         f"**{user.first_name or user.username}** joined using your referral link!\n"
+                                         f"You'll earn {REFERRAL_COMMISSION_RATE * 100:.0f}% commission from their fees.",
+                                    parse_mode=ParseMode.MARKDOWN
+                                )
+                            except Exception as e:
+                                logger.error(f"Failed to notify referrer {referrer_id}: {e}")
+                    else:
+                        referral_message = "\n⚠️ **Referral Info:** You already have a referrer or invalid referral link.\n"
+                elif existing_referrer:
+                    referral_message = f"\n📎 **Existing Referral:** You're already referred by someone else.\n"
+                    
+            except (ValueError, IndexError):
+                logger.warning(f"Invalid referral parameter: {context.args[0]}")
         
         welcome_text = f"""
 🤖 **Welcome to Telegram Group Market Bot!**
 
-Hello {user.first_name or user.username}! 👋
+Hello {user.first_name or user.username}! 👋{referral_message}
 
 This bot allows you to buy and sell Telegram groups in a secure marketplace.
 
@@ -1738,11 +1976,13 @@ This bot allows you to buy and sell Telegram groups in a secure marketplace.
 • List your own groups for sale
 • Manage your balance and withdrawals
 • Transfer group ownership securely
+• Earn from referrals ({REFERRAL_COMMISSION_RATE * 100:.0f}% commission!)
 
 💰 **Current Balance:** ${format_balance(db.get_user_balance(user.id))} USDT
 
 📱 **Quick Start:**
 • Use `/market` to browse available groups
+• Use `/referral` to get your referral link
 • Use `/help` to see all commands
 • Send USDT via @cctip_bot in the bank group to add balance
 
@@ -1750,6 +1990,70 @@ Ready to start trading? 🚀
 """
         
         await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
+    
+    async def referral_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /referral command - show referral statistics and link"""
+        user = update.effective_user
+        
+        # Get referral statistics
+        stats = db.get_referral_stats(user.id)
+        
+        # Generate referral link
+        bot_username = context.bot.username or "YourBot"
+        referral_link = f"https://t.me/{bot_username}?start={user.id}"
+        
+        text = f"""
+🎯 **Your Referral Program**
+
+**📊 Statistics:**
+• **Total Referrals:** {stats['total_referrals']}
+• **Total Earnings:** ${format_balance(stats['total_earnings'])} USDT
+• **Commission Rate:** {REFERRAL_COMMISSION_RATE * 100:.0f}% of referral fees
+
+**🔗 Your Referral Link:**
+`{referral_link}`
+
+**💡 How it Works:**
+• Share your referral link with friends
+• When they join and make transactions (buy/sell), you earn {REFERRAL_COMMISSION_RATE * 100:.0f}% of their fees
+• Example: If someone pays $5 in fees, you earn ${5 * REFERRAL_COMMISSION_RATE:.2f}
+• Earnings are automatically credited to your balance
+
+**📈 Recent Referrals:**
+"""
+        
+        if stats['recent_referrals']:
+            for i, (referred_id, username, first_name, created_at) in enumerate(stats['recent_referrals'][:5], 1):
+                user_display = username or first_name or f"User {referred_id}"
+                # Format date
+                from datetime import datetime
+                try:
+                    date_obj = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    date_str = date_obj.strftime('%Y-%m-%d')
+                except:
+                    date_str = created_at[:10]
+                text += f"{i}. {user_display} - {date_str}\n"
+        else:
+            text += "No referrals yet. Start sharing your link! 🚀\n"
+        
+        # Show monthly breakdown if available
+        if stats['monthly_breakdown']:
+            text += f"\n**📅 Recent Daily Earnings:**\n"
+            for date, earnings in stats['monthly_breakdown'][:7]:  # Last 7 days
+                text += f"• {date}: ${format_balance(earnings)} USDT\n"
+        
+        text += f"""
+
+**💰 Tips to Maximize Earnings:**
+• Share in relevant Telegram groups/channels
+• Post on social media platforms
+• Tell friends about the marketplace
+• Active referrals = more commissions!
+
+Tap to copy your referral link above! 👆
+"""
+        
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
@@ -1889,6 +2193,23 @@ Select a year to browse groups by creation date:
 """
         
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        
+        # Notify referrer about buying fee commission
+        referrer_id = db.get_referrer(user.id)
+        if referrer_id and buying_fee > 0:
+            commission = buying_fee * REFERRAL_COMMISSION_RATE
+            try:
+                await context.bot.send_message(
+                    chat_id=referrer_id,
+                    text=f"💸 **Referral Commission Earned!**\n\n"
+                         f"Your referral bought groups!\n"
+                         f"**Commission:** ${format_price(commission)} USDT\n"
+                         f"**From:** Buying fee (${format_price(buying_fee)} USDT)\n\n"
+                         f"Commission added to your balance! 🎉",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify referrer {referrer_id}: {e}")
     
     async def claim_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /claim command with real ownership transfer"""
@@ -2028,8 +2349,33 @@ Select a year to browse groups by creation date:
                             INSERT INTO transactions (user_id, transaction_type, amount, group_ids, status)
                             VALUES (?, 'sale', ?, ?, 'completed')
                         ''', (seller_id, seller_earnings, json.dumps(transaction_details)))
+                        transaction_id = cursor.lastrowid
                         conn.commit()
                         conn.close()
+                    
+                    # Handle referral commission for selling fees
+                    referrer_id = db.get_referrer(seller_id)
+                    if referrer_id and selling_fee > 0:
+                        commission = selling_fee * REFERRAL_COMMISSION_RATE
+                        success = db.add_referral_earning(
+                            referrer_id, seller_id, 'selling_fee', selling_fee, commission, transaction_id
+                        )
+                        if success:
+                            logger.info(f"Referral commission paid: ${commission:.4f} to {referrer_id} for selling fee from {seller_id}")
+                            
+                            # Notify referrer about commission
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=referrer_id,
+                                    text=f"💸 **Referral Commission Earned!**\n\n"
+                                         f"Your referral sold a group!\n"
+                                         f"**Commission:** ${format_price(commission)} USDT\n"
+                                         f"**From:** Selling fee (${format_price(selling_fee)} USDT)\n\n"
+                                         f"Commission added to your balance! 🎉",
+                                    parse_mode=ParseMode.MARKDOWN
+                                )
+                            except Exception as e:
+                                logger.error(f"Failed to notify referrer {referrer_id}: {e}")
                     
                     # Notify seller
                     try:
@@ -4401,6 +4747,7 @@ class TelegramMarketBot:
         app.add_handler(CommandHandler("cprice", bot_commands.cprice_command))
         app.add_handler(CommandHandler("withdraw", bot_commands.withdraw_command))
         app.add_handler(CommandHandler("done", bot_commands.done_command))
+        app.add_handler(CommandHandler("referral", bot_commands.referral_command))
         
         # Admin Commands
         app.add_handler(CommandHandler("ahelp", bot_commands.admin_help_command))

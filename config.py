@@ -29,6 +29,9 @@ MIN_WITHDRAWAL = 1.0
 BUYING_FEE_RATE = 0.005  # 0.5% buying fee
 SELLING_FEE_RATE = 0.005  # 0.5% selling fee
 
+# Referral Configuration
+REFERRAL_COMMISSION_RATE = 0.10  # 10% of fees earned by referrals
+
 # Create sessions directory if it doesn't exist
 if not os.path.exists(SESSIONS_DIR):
     os.makedirs(SESSIONS_DIR)
