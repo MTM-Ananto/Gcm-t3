@@ -1034,7 +1034,7 @@ def generate_admin_help_text() -> str:
 
 **👥 User Management:**
 • `/users` - View all users and their statistics
-• `/add_bal <user_id> <amount>` - Add/remove balance from user
+• `/add_bal <user id> <amount>` - Add/remove balance from user
 
 **🤖 Session Management:**
 • `/add` - Add new userbot session
@@ -2090,7 +2090,7 @@ You can get this from https://my.telegram.org
         if len(context.args) != 2:
             await update.message.reply_text(
                 "❌ Invalid usage.\n\n"
-                "**Usage:** `/add_bal <user_id> <amount>`\n"
+                "**Usage:** `/add_bal <user id> <amount>`\n"
                 "**Example:** `/add_bal 123456789 10.50`",
                 parse_mode=ParseMode.MARKDOWN
             )
