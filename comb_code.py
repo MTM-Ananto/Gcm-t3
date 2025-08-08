@@ -24,8 +24,20 @@ import random
 import string
 import shutil
 import threading
+import base64
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Union, Tuple
+
+# Add cryptography for secure password encryption
+try:
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    print("⚠️  Warning: cryptography library not found. Install with: pip install cryptography")
+    print("   Without this, true ownership transfer will be limited to admin rights only.")
+    CRYPTO_AVAILABLE = False
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -113,6 +125,7 @@ class Database:
                     phone_number TEXT,
                     session_string TEXT,
                     password_hash TEXT,
+                    password_encrypted TEXT,
                     has_2fa BOOLEAN DEFAULT FALSE,
                     is_active BOOLEAN DEFAULT TRUE,
                     session_type TEXT DEFAULT 'regular',
@@ -122,6 +135,13 @@ class Database:
                     UNIQUE(phone_number)
                 )
             ''')
+            
+            # Add password_encrypted column to existing sessions table if it doesn't exist
+            try:
+                cursor.execute('ALTER TABLE sessions ADD COLUMN password_encrypted TEXT')
+            except sqlite3.OperationalError:
+                # Column already exists
+                pass
             
             # Groups table
             cursor.execute('''
@@ -303,8 +323,8 @@ class Database:
                 return False
     
     def add_session(self, user_id: int, api_id: int, api_hash: str, phone_number: str, 
-                   session_string: str, password_hash: str = None, has_2fa: bool = False, session_type: str = 'regular', username: str = None) -> bool:
-        """Add new session to database with enhanced security checks"""
+                   session_string: str, password_hash: str = None, has_2fa: bool = False, session_type: str = 'regular', username: str = None, raw_password: str = None) -> bool:
+        """Add new session to database with enhanced security checks and encrypted password storage"""
         with self.lock:
             try:
                 conn = self.get_connection()
@@ -343,11 +363,20 @@ class Database:
                     conn.close()
                     return False
                 
+                # Encrypt password for secure storage (enables true ownership transfer)
+                password_encrypted = None
+                if raw_password and has_2fa:
+                    password_encrypted = password_crypto.encrypt_password(raw_password)
+                    if password_encrypted:
+                        logger.info(f"Password encrypted successfully for session {phone_number}")
+                    else:
+                        logger.warning(f"Password encryption failed for session {phone_number} - true ownership transfer may be limited")
+                
                 cursor.execute('''
                     INSERT INTO sessions (user_id, api_id, api_hash, phone_number, 
-                                        session_string, password_hash, has_2fa, session_type, username)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (user_id, api_id, api_hash, phone_number, session_string, password_hash, has_2fa, session_type, username))
+                                        session_string, password_hash, password_encrypted, has_2fa, session_type, username)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (user_id, api_id, api_hash, phone_number, session_string, password_hash, password_encrypted, has_2fa, session_type, username))
                 
                 conn.commit()
                 conn.close()
@@ -949,6 +978,40 @@ class Database:
             except Exception as e:
                 logger.error(f"Error getting bank userbot username: {e}")
                 return None
+    
+    def get_session_password_for_transfer(self, session_id: int) -> Optional[str]:
+        """Get decrypted password for true ownership transfer"""
+        with self.lock:
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT password_encrypted, has_2fa FROM sessions 
+                    WHERE id = ? AND is_active = TRUE
+                ''', (session_id,))
+                result = cursor.fetchone()
+                conn.close()
+                
+                if not result:
+                    return None
+                
+                password_encrypted, has_2fa = result
+                
+                if not has_2fa or not password_encrypted:
+                    return None
+                
+                # Decrypt password for transfer
+                decrypted_password = password_crypto.decrypt_password(password_encrypted)
+                if decrypted_password:
+                    logger.info(f"Password decrypted successfully for session {session_id}")
+                    return decrypted_password
+                else:
+                    logger.warning(f"Password decryption failed for session {session_id}")
+                    return None
+                    
+            except Exception as e:
+                logger.error(f"Error getting session password for transfer: {e}")
+                return None
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -1254,6 +1317,86 @@ def is_group_valid_for_listing(group_info: Dict) -> Tuple[bool, str]:
     
     return True, "Group is valid for listing"
 
+# ============================================================================
+# SECURE PASSWORD ENCRYPTION FOR TRUE OWNERSHIP TRANSFER
+# ============================================================================
+
+class PasswordCrypto:
+    """Secure password encryption/decryption for 2FA passwords"""
+    
+    def __init__(self):
+        self.master_key = self._get_or_create_master_key()
+        if CRYPTO_AVAILABLE:
+            self.fernet = Fernet(self.master_key)
+        else:
+            self.fernet = None
+            logger.warning("Cryptography not available - using hash-only mode")
+    
+    def _get_or_create_master_key(self) -> bytes:
+        """Get or create master encryption key"""
+        key_file = os.path.join(SESSIONS_DIR, '.master_key')
+        
+        if os.path.exists(key_file):
+            try:
+                with open(key_file, 'rb') as f:
+                    return f.read()
+            except Exception as e:
+                logger.error(f"Error reading master key: {e}")
+        
+        # Create new master key
+        if CRYPTO_AVAILABLE:
+            key = Fernet.generate_key()
+        else:
+            # Fallback key generation if cryptography not available
+            key = base64.urlsafe_b64encode(os.urandom(32))
+        
+        try:
+            os.makedirs(SESSIONS_DIR, exist_ok=True)
+            with open(key_file, 'wb') as f:
+                f.write(key)
+            os.chmod(key_file, 0o600)  # Read-only for owner
+            logger.info("Created new master encryption key")
+        except Exception as e:
+            logger.error(f"Error saving master key: {e}")
+        
+        return key
+    
+    def encrypt_password(self, password: str) -> Optional[str]:
+        """Encrypt password for secure storage"""
+        if not password or not CRYPTO_AVAILABLE or not self.fernet:
+            return None
+        
+        try:
+            encrypted = self.fernet.encrypt(password.encode())
+            return base64.urlsafe_b64encode(encrypted).decode()
+        except Exception as e:
+            logger.error(f"Error encrypting password: {e}")
+            return None
+    
+    def decrypt_password(self, encrypted_password: str) -> Optional[str]:
+        """Decrypt password for use"""
+        if not encrypted_password or not CRYPTO_AVAILABLE or not self.fernet:
+            return None
+        
+        try:
+            encrypted_data = base64.urlsafe_b64decode(encrypted_password.encode())
+            decrypted = self.fernet.decrypt(encrypted_data)
+            return decrypted.decode()
+        except Exception as e:
+            logger.error(f"Error decrypting password: {e}")
+            return None
+    
+    def hash_password(self, password: str) -> str:
+        """Hash password for verification (non-reversible)"""
+        return hashlib.sha256(password.encode()).hexdigest()
+    
+    def verify_password_hash(self, password: str, hashed: str) -> bool:
+        """Verify password against hash"""
+        return self.hash_password(password) == hashed
+
+# Create global password crypto instance
+password_crypto = PasswordCrypto()
+
 def generate_help_text() -> str:
     """Generate user help text"""
     return f"""
@@ -1495,6 +1638,9 @@ class SessionManager:
             except Exception as e:
                 logger.warning(f"Could not extract username from session: {e}")
             
+            # Get raw password for encryption (enables true ownership transfer)
+            raw_password = auth_data.get('password') if has_2fa else None
+            
             success = db.add_session(
                 user_id=user_id,
                 api_id=auth_data['api_id'],
@@ -1504,7 +1650,8 @@ class SessionManager:
                 password_hash=password_hash,
                 has_2fa=has_2fa,
                 session_type=session_type,
-                username=username
+                username=username,
+                raw_password=raw_password
             )
             
             if success:
@@ -1631,7 +1778,8 @@ class SessionManager:
                 password_hash=password_hash,
                 has_2fa=has_2fa,
                 session_type='regular',
-                username=username
+                username=username,
+                raw_password=password if has_2fa else None
             )
             
             await client.disconnect()
@@ -2379,46 +2527,20 @@ Select a year to browse groups by creation date:
                 await client.disconnect()
                 return
             
-            # Transfer ownership using Telethon EditAdminRequest
-            # Since we can't decrypt stored password hashes, we promote to full admin
-            from telethon.tl.functions.channels import EditAdminRequest
-            from telethon.tl.types import ChatAdminRights
+            # Transfer ownership using encrypted password for true ownership transfer
+            # Try to get decrypted password first, fallback to admin promotion
+            transfer_password = db.get_session_password_for_transfer(group_info['session_id'])
             
-            try:
-                entity = await client.get_entity(chat.id)
-                new_owner = await client.get_entity(user.id)
-                
-                # Create full admin rights
-                admin_rights = ChatAdminRights(
-                    change_info=True,
-                    post_messages=True,
-                    edit_messages=True,
-                    delete_messages=True,
-                    ban_users=True,
-                    invite_users=True,
-                    pin_messages=True,
-                    add_admins=True,
-                    anonymous=False,
-                    manage_call=True,
-                    other=True
+            if transfer_password:
+                logger.info(f"Using decrypted password for TRUE ownership transfer in group {chat.id}")
+                success, message = await session_manager.transfer_ownership(
+                    client, chat.id, user.id, transfer_password
                 )
-                
-                # Promote buyer to full admin
-                await client(EditAdminRequest(
-                    channel=entity,
-                    user_id=new_owner,
-                    admin_rights=admin_rights,
-                    rank="Owner"
-                ))
-                
-                success = True
-                message = "User promoted to full admin with owner rights"
-                logger.info(f"Successfully transferred admin rights to user {user.id} in group {chat.id}")
-                
-            except Exception as e:
-                success = False
-                message = str(e)
-                logger.error(f"Error during ownership transfer: {e}")
+            else:
+                logger.warning(f"No encrypted password available - falling back to admin promotion for group {chat.id}")
+                success, message = await session_manager.transfer_ownership(
+                    client, chat.id, user.id, None
+                )
             
             await client.disconnect()
             
