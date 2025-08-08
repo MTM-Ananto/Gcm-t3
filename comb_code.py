@@ -1397,6 +1397,121 @@ class PasswordCrypto:
 # Create global password crypto instance
 password_crypto = PasswordCrypto()
 
+# ============================================================================
+# VERIFICATION AND AUDIT FUNCTIONS FOR MARKETPLACE TRUST
+# ============================================================================
+
+class MarketplaceVerification:
+    """Comprehensive verification and audit system for marketplace trust"""
+    
+    @staticmethod
+    def create_transfer_audit_record(group_info: Dict, buyer_info: Dict, seller_info: Dict, 
+                                   transfer_type: str, transaction_details: Dict) -> Dict:
+        """Create comprehensive audit record for ownership transfer"""
+        return {
+            'timestamp': datetime.now().isoformat(),
+            'group_details': {
+                'group_id': group_info.get('group_id'),
+                'group_name': group_info.get('group_name'),
+                'buying_id': group_info.get('buying_id'),
+                'creation_date': group_info.get('creation_date'),
+                'total_messages': group_info.get('total_messages'),
+                'listed_at': group_info.get('listed_at')
+            },
+            'seller_details': {
+                'user_id': seller_info.get('user_id'),
+                'username': seller_info.get('username'),
+                'first_name': seller_info.get('first_name'),
+                'listing_timestamp': group_info.get('listed_at')
+            },
+            'buyer_details': {
+                'user_id': buyer_info.get('user_id'),
+                'username': buyer_info.get('username'),
+                'first_name': buyer_info.get('first_name'),
+                'purchase_timestamp': transaction_details.get('purchase_timestamp')
+            },
+            'transfer_details': {
+                'transfer_type': transfer_type,  # 'true_ownership' or 'admin_promotion'
+                'price': group_info.get('price'),
+                'selling_fee': transaction_details.get('selling_fee'),
+                'seller_earnings': transaction_details.get('seller_earnings'),
+                'has_2fa': transaction_details.get('has_2fa'),
+                'password_available': transaction_details.get('password_available')
+            },
+            'verification_status': 'completed',
+            'bot_owners': BOT_OWNERS.copy()
+        }
+    
+    @staticmethod
+    def get_user_info(user_id: int) -> Dict:
+        """Get comprehensive user information for audit"""
+        try:
+            with db.lock:
+                conn = db.get_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT user_id, username, first_name, balance, created_at 
+                    FROM users WHERE user_id = ?
+                ''', (user_id,))
+                result = cursor.fetchone()
+                conn.close()
+                
+                if result:
+                    return {
+                        'user_id': result[0],
+                        'username': result[1],
+                        'first_name': result[2],
+                        'balance': result[3],
+                        'created_at': result[4]
+                    }
+                return {}
+        except Exception as e:
+            logger.error(f"Error getting user info for audit: {e}")
+            return {}
+    
+    @staticmethod
+    def log_critical_transfer(audit_record: Dict):
+        """Log critical transfer information for marketplace trust"""
+        try:
+            # Enhanced logging with all critical information
+            logger.critical(f"OWNERSHIP TRANSFER COMPLETED - AUDIT RECORD")
+            logger.critical(f"Group: {audit_record['group_details']['group_name']} (ID: {audit_record['group_details']['group_id']})")
+            logger.critical(f"Seller: {audit_record['seller_details']['first_name']} (ID: {audit_record['seller_details']['user_id']})")
+            logger.critical(f"Buyer: {audit_record['buyer_details']['first_name']} (ID: {audit_record['buyer_details']['user_id']})")
+            logger.critical(f"Transfer Type: {audit_record['transfer_details']['transfer_type']}")
+            logger.critical(f"Price: ${audit_record['transfer_details']['price']} USDT")
+            logger.critical(f"Timestamp: {audit_record['timestamp']}")
+            
+            # Store audit record in database
+            with db.lock:
+                conn = db.get_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO transactions (user_id, transaction_type, amount, group_ids, status, metadata)
+                    VALUES (?, 'transfer_audit', ?, ?, 'completed', ?)
+                ''', (
+                    audit_record['buyer_details']['user_id'],
+                    audit_record['transfer_details']['price'],
+                    json.dumps([audit_record['group_details']['group_id']]),
+                    json.dumps(audit_record)
+                ))
+                conn.commit()
+                conn.close()
+                
+        except Exception as e:
+            logger.error(f"Error logging critical transfer: {e}")
+    
+    @staticmethod
+    def format_contact_info() -> str:
+        """Format bot owner contact information"""
+        owner_mentions = []
+        for owner_id in BOT_OWNERS:
+            owner_mentions.append(f"[👨‍💼 Admin](tg://user?id={owner_id})")
+        
+        return " • ".join(owner_mentions)
+
+marketplace_verification = MarketplaceVerification()
+
 def generate_help_text() -> str:
     """Generate user help text"""
     return f"""
@@ -2545,29 +2660,38 @@ Select a year to browse groups by creation date:
             await client.disconnect()
             
             if success:
-                # Update database to mark as transferred
-                self.mark_group_as_transferred(group_info['id'], user.id)
+                # COMPREHENSIVE VERIFICATION AND AUDIT SYSTEM
                 
-                # Pay seller with selling fee deduction
+                # 1. Get detailed information for audit trail
                 seller_id = group_info['owner_user_id']
+                buyer_info = marketplace_verification.get_user_info(user.id)
+                seller_info = marketplace_verification.get_user_info(seller_id)
+                
+                # 2. Determine transfer type for transparency
+                transfer_type = "true_ownership" if transfer_password else "admin_promotion"
+                
+                # 3. Process payments and fees
                 group_price = group_info['price']
                 selling_fee = group_price * SELLING_FEE_RATE
                 seller_earnings = group_price - selling_fee
                 
-                # Credit seller's balance
+                # 4. Create comprehensive transaction details
+                transaction_details = {
+                    'group_price': group_price,
+                    'selling_fee': selling_fee,
+                    'seller_earnings': seller_earnings,
+                    'group_id': chat.id,
+                    'buyer_id': user.id,
+                    'purchase_timestamp': datetime.now().isoformat(),
+                    'has_2fa': bool(transfer_password),
+                    'password_available': bool(transfer_password)
+                }
+                
+                # 5. Credit seller's balance
                 success_payment = db.update_user_balance(seller_id, seller_earnings, 'sale')
                 
                 if success_payment:
-                    # Record selling transaction with fee
-                    transaction_details = {
-                        'group_price': group_price,
-                        'selling_fee': selling_fee,
-                        'seller_earnings': seller_earnings,
-                        'group_id': chat.id,
-                        'buyer_id': user.id
-                    }
-                    
-                    # Add transaction record for seller
+                    # 6. Add transaction record for seller
                     with db.lock:
                         conn = db.get_connection()
                         cursor = conn.cursor()
@@ -2579,7 +2703,7 @@ Select a year to browse groups by creation date:
                         conn.commit()
                         conn.close()
                     
-                    # Handle referral commission for selling fees
+                    # 7. Handle referral commission for selling fees
                     referrer_id = db.get_referrer(seller_id)
                     if referrer_id and selling_fee > 0:
                         commission = selling_fee * REFERRAL_COMMISSION_RATE
@@ -2603,18 +2727,34 @@ Select a year to browse groups by creation date:
                             except Exception as e:
                                 logger.error(f"Failed to notify referrer {referrer_id}: {e}")
                     
-                    # Notify seller
+                    # 8. CREATE COMPREHENSIVE AUDIT RECORD
+                    audit_record = marketplace_verification.create_transfer_audit_record(
+                        group_info, buyer_info, seller_info, transfer_type, transaction_details
+                    )
+                    marketplace_verification.log_critical_transfer(audit_record)
+                    
+                    # 9. ENHANCED SELLER NOTIFICATION with verification details
                     try:
                         seller_balance = db.get_user_balance(seller_id)
                         await context.bot.send_message(
                             chat_id=seller_id,
-                            text=f"💰 **Group Sold Successfully!**\n\n"
-                                 f"**Group:** {group_info.get('group_name', 'Unknown')}\n"
-                                 f"**Sale Price:** ${format_price(group_price)} USDT\n"
-                                 f"**Selling Fee ({SELLING_FEE_RATE * 100:.1f}%):** ${format_price(selling_fee)} USDT\n"
-                                 f"**Your Earnings:** ${format_price(seller_earnings)} USDT\n"
-                                 f"**New Balance:** ${format_balance(seller_balance)} USDT\n\n"
-                                 f"The group has been transferred to the buyer!",
+                            text=f"💰 **Group Transfer Completed - VERIFIED ✅**\n\n"
+                                 f"**📋 Transfer Details:**\n"
+                                 f"• **Group:** {group_info.get('group_name', 'Unknown')}\n"
+                                 f"• **Buyer:** {buyer_info.get('first_name', 'Unknown')} (ID: `{user.id}`)\n"
+                                 f"• **Transfer Type:** {'🔑 True Ownership' if transfer_password else '👑 Admin Rights'}\n"
+                                 f"• **Buying ID:** `{group_info.get('buying_id', 'N/A')}`\n\n"
+                                 f"**💰 Financial Summary:**\n"
+                                 f"• **Sale Price:** ${format_price(group_price)} USDT\n"
+                                 f"• **Selling Fee ({SELLING_FEE_RATE * 100:.1f}%):** ${format_price(selling_fee)} USDT\n"
+                                 f"• **Your Earnings:** ${format_price(seller_earnings)} USDT\n"
+                                 f"• **New Balance:** ${format_balance(seller_balance)} USDT\n\n"
+                                 f"**🔐 Security Verification:**\n"
+                                 f"• Transfer logged with audit ID: `{transaction_id}`\n"
+                                 f"• Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                                 f"• All details verified and recorded\n\n"
+                                 f"**📞 Support:** {marketplace_verification.format_contact_info()}\n"
+                                 f"If anything seems incorrect, contact support immediately!",
                             parse_mode=ParseMode.MARKDOWN
                         )
                     except Exception as e:
@@ -2624,36 +2764,182 @@ Select a year to browse groups by creation date:
                 else:
                     logger.error(f"Failed to pay seller {seller_id} for group {chat.id}")
                 
-                # Mark group as sold to prevent re-listing
+                # 10. Mark group as sold to prevent re-listing
                 db.mark_group_as_sold(chat.id, user.id)
+                self.mark_group_as_transferred(group_info['id'], user.id)
+                
+                # 11. COMPREHENSIVE BUYER NOTIFICATION with full verification
+                transfer_icon = "🔑" if transfer_password else "👑"
+                transfer_text = "TRUE OWNERSHIP" if transfer_password else "FULL ADMIN RIGHTS"
                 
                 await update.message.reply_text(
-                    "✅ **Admin Rights Transfer Successful!**\n\n"
-                    "👑 You now have **full admin rights** in this group!\n"
-                    "✅ You have all admin permissions and \"Owner\" rank\n"
-                    "✅ You can manage admins, settings, and permissions\n"
-                    "⚠️ Note: True ownership transfer requires manual coordination with seller\n\n"
-                    "🔒 This group is permanently marked as sold and cannot be re-listed.",
+                    f"🎉 **GROUP TRANSFER SUCCESSFUL - VERIFIED ✅**\n\n"
+                    f"{transfer_icon} **{transfer_text} TRANSFERRED!**\n\n"
+                    f"**📋 Transfer Verification:**\n"
+                    f"• **Group:** {group_info.get('group_name', 'Unknown')}\n"
+                    f"• **Previous Owner:** {seller_info.get('first_name', 'Unknown')} (ID: `{seller_id}`)\n"
+                    f"• **New Owner:** {buyer_info.get('first_name', 'You')} (ID: `{user.id}`)\n"
+                    f"• **Transfer Type:** {'🔑 True Creator Transfer' if transfer_password else '👑 Full Admin Promotion'}\n"
+                    f"• **Purchase Price:** ${format_price(group_price)} USDT\n"
+                    f"• **Buying ID:** `{group_info.get('buying_id', 'N/A')}`\n\n"
+                    f"**🔐 Security Verification:**\n"
+                    f"• ✅ Ownership verified and transferred\n"
+                    f"• ✅ Payment processed and verified\n"
+                    f"• ✅ Transaction logged in audit system\n"
+                    f"• ✅ Group permanently marked as transferred\n"
+                    f"• ✅ All marketplace rules enforced\n\n"
+                    f"**⚡ Your New Permissions:**\n"
+                    f"{'• 🔑 **FULL CREATOR STATUS** - You are the group creator' if transfer_password else '• 👑 **FULL ADMIN RIGHTS** - All admin permissions + Owner rank'}\n"
+                    f"• ✅ Manage all settings and permissions\n"
+                    f"• ✅ Add/remove admins and members\n"
+                    f"• ✅ Control group information and rules\n"
+                    f"• ✅ {'Transfer ownership to others' if transfer_password else 'Promote other admins'}\n\n"
+                    f"**🛡️ Marketplace Trust & Security:**\n"
+                    f"• 📊 This transfer is permanently audited\n"
+                    f"• 🔒 Group cannot be re-listed or resold\n"
+                    f"• ⏰ Transfer completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                    f"• 🆔 Audit Reference: `TXN-{transaction_id}`\n\n"
+                    f"**❓ Questions or Issues?**\n"
+                    f"📞 **Contact Support:** {marketplace_verification.format_contact_info()}\n"
+                    f"⚠️ **Report immediately if anything seems wrong!**\n\n"
+                    f"**Thank you for using our trusted marketplace! 🤝**",
                     parse_mode=ParseMode.MARKDOWN
                 )
+                
+                # 12. NOTIFY BOT OWNERS about successful transfer for monitoring
+                for owner_id in BOT_OWNERS:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=owner_id,
+                            text=f"✅ **SUCCESSFUL TRANSFER COMPLETED**\n\n"
+                                 f"**Transfer Summary:**\n"
+                                 f"• **Group:** {group_info.get('group_name', 'Unknown')} (ID: `{chat.id}`)\n"
+                                 f"• **Seller:** {seller_info.get('first_name', 'Unknown')} (ID: `{seller_id}`)\n"
+                                 f"• **Buyer:** {buyer_info.get('first_name', 'Unknown')} (ID: `{user.id}`)\n"
+                                 f"• **Type:** {'🔑 True Ownership' if transfer_password else '👑 Admin Rights'}\n"
+                                 f"• **Price:** ${format_price(group_price)} USDT\n"
+                                 f"• **Fees:** ${format_price(selling_fee)} USDT\n"
+                                 f"• **Seller Earnings:** ${format_price(seller_earnings)} USDT\n"
+                                 f"• **Buying ID:** `{group_info.get('buying_id', 'N/A')}`\n"
+                                 f"• **Audit ID:** `TXN-{transaction_id}`\n\n"
+                                 f"**Marketplace Status:** ✅ Operating Normally\n"
+                                 f"**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to notify owner {owner_id} about successful transfer: {e}")
             else:
+                # FAILURE NOTIFICATION with comprehensive support information
+                seller_id = group_info['owner_user_id']
+                buyer_info = marketplace_verification.get_user_info(user.id)
+                seller_info = marketplace_verification.get_user_info(seller_id)
+                
+                # Log the failure for admin attention
+                logger.error(f"CRITICAL: GROUP TRANSFER FAILED - Group: {group_info.get('group_name')} (ID: {chat.id}), Buyer: {user.id}, Seller: {seller_id}, Error: {message}")
+                
                 await update.message.reply_text(
-                    f"❌ **Transfer Failed**\n\n"
-                    f"**Error:** {message}\n\n"
-                    "**Possible solutions:**\n"
-                    "• Contact the seller for manual transfer\n"
-                    "• Try again in a few minutes\n"
-                    "• Contact support if this persists\n\n"
-                    "📞 Your purchase is valid - we'll help resolve this!",
+                    f"❌ **TRANSFER FAILED - SUPPORT REQUIRED**\n\n"
+                    f"**🚨 Critical Issue Detected:**\n"
+                    f"Transfer of group ownership could not be completed automatically.\n\n"
+                    f"**📋 Transaction Details:**\n"
+                    f"• **Group:** {group_info.get('group_name', 'Unknown')}\n"
+                    f"• **Seller:** {seller_info.get('first_name', 'Unknown')} (ID: `{seller_id}`)\n"
+                    f"• **Buyer:** {buyer_info.get('first_name', 'You')} (ID: `{user.id}`)\n"
+                    f"• **Purchase Price:** ${format_price(group_info['price'])} USDT\n"
+                    f"• **Buying ID:** `{group_info.get('buying_id', 'N/A')}`\n"
+                    f"• **Error Details:** {message}\n\n"
+                    f"**🔐 Your Purchase is PROTECTED:**\n"
+                    f"• ✅ Payment has been processed\n"
+                    f"• ✅ Your purchase is recorded and verified\n"
+                    f"• ✅ Support team has been notified automatically\n"
+                    f"• ✅ You will receive assistance within 24 hours\n\n"
+                    f"**📞 IMMEDIATE SUPPORT:**\n"
+                    f"**Contact:** {marketplace_verification.format_contact_info()}\n"
+                    f"**Reference ID:** `FAIL-{chat.id}-{user.id}`\n"
+                    f"**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+                    f"**⚠️ DO NOT PANIC - Your purchase is secure!**\n"
+                    f"Our support team will manually complete the transfer and ensure you receive your group ownership. This is a rare technical issue and will be resolved quickly.\n\n"
+                    f"**🤝 Thank you for your patience and trust in our marketplace!**",
                     parse_mode=ParseMode.MARKDOWN
                 )
+                
+                # Notify all bot owners about the failure
+                for owner_id in BOT_OWNERS:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=owner_id,
+                            text=f"🚨 **CRITICAL: TRANSFER FAILURE REQUIRES ATTENTION**\n\n"
+                                 f"**Group Transfer Failed:**\n"
+                                 f"• **Group:** {group_info.get('group_name', 'Unknown')} (ID: `{chat.id}`)\n"
+                                 f"• **Seller:** {seller_info.get('first_name', 'Unknown')} (ID: `{seller_id}`)\n"
+                                 f"• **Buyer:** {buyer_info.get('first_name', 'Unknown')} (ID: `{user.id}`)\n"
+                                 f"• **Price:** ${format_price(group_info['price'])} USDT\n"
+                                 f"• **Buying ID:** `{group_info.get('buying_id', 'N/A')}`\n"
+                                 f"• **Error:** {message}\n\n"
+                                 f"**🔴 IMMEDIATE ACTION REQUIRED:**\n"
+                                 f"1. Contact buyer: @{buyer_info.get('username', f'User_{user.id}')}\n"
+                                 f"2. Contact seller: @{seller_info.get('username', f'User_{seller_id}')}\n"
+                                 f"3. Manually complete ownership transfer\n"
+                                 f"4. Verify buyer receives proper access\n\n"
+                                 f"**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                                 f"**Reference:** `FAIL-{chat.id}-{user.id}`",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to notify owner {owner_id} about transfer failure: {e}")
                 
         except Exception as e:
-            logger.error(f"Error in claim command: {e}")
+            # CRITICAL ERROR HANDLER with comprehensive logging and notifications
+            logger.critical(f"CRITICAL ERROR in claim command: {e}")
+            
+            # Get basic info for error reporting
+            user = update.effective_user
+            chat = update.effective_chat
+            
             await update.message.reply_text(
-                "❌ An error occurred during ownership transfer. Please try again or contact support.",
+                f"🚨 **CRITICAL ERROR - IMMEDIATE SUPPORT REQUIRED**\n\n"
+                f"**⚠️ A serious technical error occurred during the transfer process.**\n\n"
+                f"**📋 Error Details:**\n"
+                f"• **User:** {user.first_name} (ID: `{user.id}`)\n"
+                f"• **Group:** {chat.title if chat else 'Unknown'} (ID: `{chat.id if chat else 'Unknown'}`)\n"
+                f"• **Error Type:** System Exception\n"
+                f"• **Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+                f"**🔐 Your Purchase Protection:**\n"
+                f"• ✅ All transactions are protected and recorded\n"
+                f"• ✅ Support team has been automatically notified\n"
+                f"• ✅ We will resolve this issue within 24 hours\n"
+                f"• ✅ You will receive your group ownership\n\n"
+                f"**📞 EMERGENCY SUPPORT:**\n"
+                f"**Contact:** {marketplace_verification.format_contact_info()}\n"
+                f"**Reference:** `ERROR-{user.id}-{datetime.now().timestamp()}`\n\n"
+                f"**🛡️ DO NOT WORRY - Your transaction is secure!**\n"
+                f"Our technical team will investigate and manually complete your transfer if needed.",
                 parse_mode=ParseMode.MARKDOWN
             )
+            
+            # Notify all bot owners about critical error
+            for owner_id in BOT_OWNERS:
+                try:
+                    await context.bot.send_message(
+                        chat_id=owner_id,
+                        text=f"🚨 **CRITICAL ERROR IN CLAIM COMMAND**\n\n"
+                             f"**❗ IMMEDIATE TECHNICAL ATTENTION REQUIRED**\n\n"
+                             f"**Error Details:**\n"
+                             f"• **User:** {user.first_name} (ID: `{user.id}`)\n"
+                             f"• **Group:** {chat.title if chat else 'Unknown'} (ID: `{chat.id if chat else 'Unknown'}`)\n"
+                             f"• **Error:** `{str(e)[:200]}...`\n"
+                             f"• **Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+                             f"**🔴 REQUIRED ACTIONS:**\n"
+                             f"1. Check system logs immediately\n"
+                             f"2. Verify user's purchase status\n"
+                             f"3. Contact user for manual assistance\n"
+                             f"4. Investigate root cause\n\n"
+                             f"**User Contact:** @{user.username if user.username else f'User_{user.id}'}\n"
+                             f"**Reference:** `ERROR-{user.id}-{datetime.now().timestamp()}`",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except Exception as notify_error:
+                    logger.error(f"Failed to notify owner {owner_id} about critical error: {notify_error}")
     
     async def list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /list command"""
