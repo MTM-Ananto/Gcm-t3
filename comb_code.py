@@ -35,8 +35,13 @@ try:
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     CRYPTO_AVAILABLE = True
 except ImportError:
-    print("⚠️  Warning: cryptography library not found. Install with: pip install cryptography")
-    print("   Without this, true ownership transfer will be limited to admin rights only.")
+    print("🚨 CRITICAL WARNING: cryptography library not found!")
+    print("   Install with: pip install cryptography")
+    print("   ⚠️  Without this:")
+    print("   - True ownership transfer will be limited to admin rights only")
+    print("   - 2FA passwords will NOT be encrypted (SECURITY RISK)")
+    print("   - Marketplace functionality will be degraded")
+    print("   📞 Install cryptography immediately for production use!")
     CRYPTO_AVAILABLE = False
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -173,10 +178,18 @@ class Database:
                     amount REAL,
                     group_ids TEXT,
                     status TEXT DEFAULT 'pending',
+                    metadata TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users (user_id)
                 )
             ''')
+            
+            # Add metadata column to existing transactions table if it doesn't exist
+            try:
+                cursor.execute('ALTER TABLE transactions ADD COLUMN metadata TEXT')
+            except sqlite3.OperationalError:
+                # Column already exists
+                pass
             
             # Withdrawal requests table
             cursor.execute('''
@@ -2016,6 +2029,24 @@ class SessionManager:
             logger.error(f"Error checking user {user_id} in group {group_id}: {e}")
             return False
     
+    async def handle_flood_wait(self, func, *args, **kwargs):
+        """Handle FloodWait errors with exponential backoff"""
+        max_retries = 3
+        base_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                return await func(*args, **kwargs)
+            except FloodWaitError as e:
+                if attempt == max_retries - 1:
+                    raise e
+                
+                wait_time = min(e.seconds, base_delay * (2 ** attempt))
+                logger.warning(f"FloodWait error: waiting {wait_time} seconds (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(wait_time)
+        
+        raise Exception("Max retries exceeded for FloodWait")
+
     async def transfer_ownership(self, client: TelegramClient, group_id: int, new_owner_id: int, password: str = None):
         """Transfer actual group ownership using Telethon"""
         try:
@@ -2091,7 +2122,17 @@ class BotCommands:
             cursor.execute('''
                 SELECT g.*, t.user_id as buyer_id
                 FROM groups g
-                JOIN transactions t ON JSON_EXTRACT(t.group_ids, '$') LIKE '%' || g.group_id || '%'
+                JOIN transactions t ON (
+                    JSON_EXTRACT(t.group_ids, '$[0]') = g.group_id OR
+                    JSON_EXTRACT(t.group_ids, '$[1]') = g.group_id OR
+                    JSON_EXTRACT(t.group_ids, '$[2]') = g.group_id OR
+                    JSON_EXTRACT(t.group_ids, '$[3]') = g.group_id OR
+                    JSON_EXTRACT(t.group_ids, '$[4]') = g.group_id OR
+                    EXISTS (
+                        SELECT 1 FROM json_each(t.group_ids) 
+                        WHERE json_each.value = g.group_id
+                    )
+                )
                 WHERE g.group_id = ? AND t.user_id = ? AND t.transaction_type = 'purchase'
                 AND t.status = 'completed' AND g.is_listed = FALSE
             ''', (group_id, user_id))
@@ -4092,6 +4133,8 @@ You can get this from https://my.telegram.org
             await self.handle_year_selection(query, context)
         elif data.startswith('month_'):
             await self.handle_month_selection(query, context)
+        elif data.startswith('market_page_'):
+            await self.handle_market_page_selection(query, context)
         elif data == 'market_back':
             await self.market_command(update, context)
         elif data.startswith("manage_session_"):
@@ -4112,6 +4155,23 @@ You can get this from https://my.telegram.org
             await self.handle_restart_session_setup(query, context)
         elif data == "cancel_session_setup":
             await self.handle_cancel_session_setup(query, context)
+    
+    async def handle_market_page_selection(self, query, context):
+        """Handle market page navigation"""
+        page = int(query.data.split('_')[2])
+        years = get_available_years()
+        keyboard = create_market_keyboard(years, page)
+        
+        text = f"""
+🏪 **Group Market - Browse by Year**
+
+Select a year to view available groups:
+
+📅 **Available Years:** {len(years)} years ({min(years)}-{max(years)})
+📄 **Page:** {page + 1} of {(len(years) + 4) // 5}
+"""
+        
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
     
     async def handle_year_selection(self, query, context):
         """Handle year selection in market"""
@@ -5879,6 +5939,20 @@ bot_commands = BotCommands()
 def main():
     """Main function with improved error handling"""
     try:
+        # CRITICAL SECURITY CHECK
+        if not CRYPTO_AVAILABLE:
+            logger.critical("🚨 CRITICAL SECURITY WARNING: cryptography library missing!")
+            logger.critical("   This is a MAJOR SECURITY RISK for a marketplace bot!")
+            logger.critical("   Install with: pip install cryptography")
+            
+            # Allow running but warn heavily
+            response = input("\n⚠️  Continue WITHOUT encryption? This is DANGEROUS for production! (type 'yes' to continue): ")
+            if response.lower() != 'yes':
+                print("❌ Exiting for security. Install cryptography and try again.")
+                sys.exit(1)
+            
+            logger.warning("🔓 Running in INSECURE mode - 2FA passwords will not be encrypted!")
+        
         logger.info("Checking database connection...")
         total_users = db.get_total_users_count()
         logger.info(f"Database connected. Total users: {total_users}")
