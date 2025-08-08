@@ -116,6 +116,7 @@ class Database:
                     has_2fa BOOLEAN DEFAULT FALSE,
                     is_active BOOLEAN DEFAULT TRUE,
                     session_type TEXT DEFAULT 'regular',
+                    username TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users (user_id),
                     UNIQUE(phone_number)
@@ -302,7 +303,7 @@ class Database:
                 return False
     
     def add_session(self, user_id: int, api_id: int, api_hash: str, phone_number: str, 
-                   session_string: str, password_hash: str = None, has_2fa: bool = False, session_type: str = 'regular') -> bool:
+                   session_string: str, password_hash: str = None, has_2fa: bool = False, session_type: str = 'regular', username: str = None) -> bool:
         """Add new session to database with enhanced security checks"""
         with self.lock:
             try:
@@ -344,9 +345,9 @@ class Database:
                 
                 cursor.execute('''
                     INSERT INTO sessions (user_id, api_id, api_hash, phone_number, 
-                                        session_string, password_hash, has_2fa, session_type)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (user_id, api_id, api_hash, phone_number, session_string, password_hash, has_2fa, session_type))
+                                        session_string, password_hash, has_2fa, session_type, username)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (user_id, api_id, api_hash, phone_number, session_string, password_hash, has_2fa, session_type, username))
                 
                 conn.commit()
                 conn.close()
@@ -930,6 +931,24 @@ class Database:
             except Exception as e:
                 logger.error(f"Error adding referral earning: {e}")
                 return False
+    
+    def get_bank_userbot_username(self) -> Optional[str]:
+        """Get the username of the bank userbot"""
+        with self.lock:
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT username FROM sessions 
+                    WHERE session_type = 'bank' AND is_active = TRUE AND username IS NOT NULL
+                    LIMIT 1
+                ''')
+                result = cursor.fetchone()
+                conn.close()
+                return result[0] if result else None
+            except Exception as e:
+                logger.error(f"Error getting bank userbot username: {e}")
+                return None
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -1467,6 +1486,15 @@ class SessionManager:
             
             session_type = auth_data.get('session_type', 'regular')
             
+            # Get username from authenticated client
+            username = None
+            try:
+                me = await client.get_me()
+                username = me.username
+                logger.info(f"Extracted username for session: @{username}")
+            except Exception as e:
+                logger.warning(f"Could not extract username from session: {e}")
+            
             success = db.add_session(
                 user_id=user_id,
                 api_id=auth_data['api_id'],
@@ -1475,7 +1503,8 @@ class SessionManager:
                 session_string=session_string,
                 password_hash=password_hash,
                 has_2fa=has_2fa,
-                session_type=session_type
+                session_type=session_type,
+                username=username
             )
             
             if success:
@@ -1529,6 +1558,7 @@ class SessionManager:
             # Get account info
             me = await client.get_me()
             phone_number = me.phone
+            username = me.username
             
             # Check if 2FA is enabled on this account
             from telethon.tl.functions.account import GetPasswordRequest
@@ -1599,7 +1629,9 @@ class SessionManager:
                 phone_number=phone_number,
                 session_string=session_string,
                 password_hash=password_hash,
-                has_2fa=has_2fa
+                has_2fa=has_2fa,
+                session_type='regular',
+                username=username
             )
             
             await client.disconnect()
@@ -4680,6 +4712,17 @@ You will be notified when it's processed.
             logger.warning(f"Tip message does not contain user mention or recipient: {message.text}")
             return
         
+        # Get bank userbot username to validate tips
+        bank_username = db.get_bank_userbot_username()
+        if not bank_username:
+            logger.warning(f"No bank userbot configured - cannot process tips")
+            return
+        
+        # Validate that the tip is for our bank userbot
+        if not re.search(rf'USDT\s*\+\d+(?:\.\d+)?\s+@?{re.escape(bank_username)}(?:\s|$)', message.text, re.IGNORECASE):
+            logger.debug(f"Tip not for our bank userbot (@{bank_username}), ignoring")
+            return
+        
         # Extract recipient user information from the message
         recipient_info = self.extract_recipient_from_tip(message.text, message.entities or [])
         
@@ -4687,9 +4730,17 @@ You will be notified when it's processed.
             logger.warning(f"Could not extract recipient from tip message: {message.text}")
             return
         
-        recipient_user_id = recipient_info.get('user_id')
-        if not recipient_user_id:
-            logger.warning(f"No user ID found in tip message")
+        # Validate that the recipient is actually our bank userbot
+        recipient_username = recipient_info.get('username')
+        if recipient_username != bank_username:
+            logger.warning(f"Tip recipient (@{recipient_username}) is not our bank userbot (@{bank_username})")
+            return
+        
+        # The bank userbot receives tips on behalf of users - we need to determine the actual user
+        # For now, we'll extract the user who sent the original /tip command from the message
+        actual_user_id = self.extract_tipper_from_message(message.text, message.entities or [])
+        if not actual_user_id:
+            logger.warning(f"Could not determine who sent the tip")
             return
         
         # ENHANCED VALIDATION: Only accept tips with high confidence
@@ -4698,16 +4749,16 @@ You will be notified when it's processed.
             return
         
         # Update user balance
-        success = db.update_user_balance(recipient_user_id, tip_info['amount'], 'tip')
+        success = db.update_user_balance(actual_user_id, tip_info['amount'], 'tip')
         
         if success:
-            logger.info(f"Balance updated: User {recipient_user_id} +${tip_info['amount']} USDT")
+            logger.info(f"Balance updated: User {actual_user_id} +${tip_info['amount']} USDT")
             
             # Notify user about balance update
             try:
-                new_balance = db.get_user_balance(recipient_user_id)
+                new_balance = db.get_user_balance(actual_user_id)
                 await context.bot.send_message(
-                    chat_id=recipient_user_id,
+                    chat_id=actual_user_id,
                     text=f"💰 **Balance Updated!**\n\n"
                          f"**Received:** +${format_balance(tip_info['amount'])} USDT\n"
                          f"**New Balance:** ${format_balance(new_balance)} USDT\n\n"
@@ -4715,9 +4766,9 @@ You will be notified when it's processed.
                     parse_mode=ParseMode.MARKDOWN
                 )
             except Exception as e:
-                logger.error(f"Failed to notify user {recipient_user_id} about balance update: {e}")
+                logger.error(f"Failed to notify user {actual_user_id} about balance update: {e}")
         else:
-            logger.error(f"Failed to update balance for user {recipient_user_id}")
+            logger.error(f"Failed to update balance for user {actual_user_id}")
     
     def extract_recipient_from_tip(self, message_text: str, entities: List) -> Optional[Dict]:
         """Extract recipient information from Cwallet tip message"""
@@ -4799,6 +4850,49 @@ You will be notified when it's processed.
             result = cursor.fetchone()
             conn.close()
             return result[0] if result else None
+    
+    def extract_tipper_from_message(self, message_text: str, entities: List) -> Optional[int]:
+        """Extract the original tipper (user who sent the tip) from Cwallet message"""
+        try:
+            # In Cwallet format: "Username tip details:\n\nUSDT +amount @recipient"
+            # The username at the beginning is the tipper
+            
+            # Priority 1: Look for user mention in entities (most reliable)
+            for entity in entities:
+                if entity.type == 'text_mention' and entity.user:
+                    # This would be the tipper mentioned in the message
+                    if entity.offset == 0:  # At the beginning of message
+                        return entity.user.id
+                elif entity.type == 'mention':
+                    # Username mention at the beginning
+                    if entity.offset == 0:
+                        start = entity.offset
+                        end = start + entity.length
+                        username = message_text[start:end].replace('@', '')
+                        
+                        # Look up user by username in database
+                        user_id = self.get_user_id_by_username(username)
+                        if user_id:
+                            logger.info(f"Found tipper from mention: @{username} (ID: {user_id})")
+                            return user_id
+            
+            # Priority 2: Extract username from start of message
+            # Pattern: "username tip details:"
+            tipper_pattern = r'^([^\s]+)\s+tip details:'
+            match = re.search(tipper_pattern, message_text, re.IGNORECASE | re.MULTILINE)
+            if match:
+                username = match.group(1).replace('@', '')
+                user_id = self.get_user_id_by_username(username)
+                if user_id:
+                    logger.info(f"Found tipper from message pattern: @{username} (ID: {user_id})")
+                    return user_id
+            
+            logger.warning(f"Could not extract tipper from message: {message_text[:50]}...")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting tipper from message: {e}")
+            return None
     
     def verify_group_in_database(self, group_id: int) -> bool:
         """Verify that a group exists in the database"""
